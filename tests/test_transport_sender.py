@@ -1,0 +1,319 @@
+"""Tests for the client audio sender: handshake, resend, acks and reconnect.
+
+A fake in-memory transport drives the sender's reconnect and idempotent-resend
+behavior without any real socket.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime
+
+import pytest
+
+from client.transport.backoff import ReconnectBackoff
+from client.transport.sender import AudioSender, ConnectionState, TransportClosed
+from shared.protocol.enums import ErrorCode, Language, StreamSource
+from shared.protocol.messages import (
+    AudioAck,
+    ErrorEvent,
+    SessionStart,
+    StreamConfig,
+)
+
+
+def _session_start() -> SessionStart:
+    return SessionStart(
+        session_id="sess-1",
+        client_id="client-1",
+        timestamp=datetime.now(UTC),
+        streams=[
+            StreamConfig(
+                stream_number=1,
+                stream_id="mic-01",
+                source=StreamSource.MICROPHONE,
+                source_language=Language.VIETNAMESE,
+                target_language=Language.JAPANESE,
+            ),
+        ],
+    )
+
+
+class FakeTransport:
+    """In-memory transport whose ``recv`` immediately signals a closed link."""
+
+    def __init__(
+        self,
+        *,
+        stop_event: asyncio.Event | None = None,
+        set_stop_on_connect: bool = False,
+    ) -> None:
+        self.sent_text: list[str] = []
+        self.sent_bytes: list[bytes] = []
+        self.connected = False
+        self.closed = False
+        self._stop_event = stop_event
+        self._set_stop_on_connect = set_stop_on_connect
+
+    async def connect(self) -> None:
+        self.connected = True
+        if self._set_stop_on_connect and self._stop_event is not None:
+            self._stop_event.set()
+
+    async def send_text(self, data: str, /) -> None:
+        self.sent_text.append(data)
+
+    async def send_bytes(self, data: bytes, /) -> None:
+        self.sent_bytes.append(data)
+
+    async def recv(self) -> str | bytes:
+        raise TransportClosed("closed")
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _sender(
+    transport_factory,  # type: ignore[no-untyped-def]
+    *,
+    on_error=None,  # type: ignore[no-untyped-def]
+    on_state_change=None,  # type: ignore[no-untyped-def]
+    on_message=None,  # type: ignore[no-untyped-def]
+) -> AudioSender:
+    return AudioSender(
+        session_start=_session_start(),
+        transport_factory=transport_factory,
+        backoff=ReconnectBackoff(initial_ms=1, max_ms=5),
+        buffer_capacity=8,
+        on_error=on_error,
+        on_state_change=on_state_change,
+        on_message=on_message,
+    )
+
+
+async def test_open_sends_handshake_and_resends_pending() -> None:
+    sender = _sender(FakeTransport)
+    sender.send_audio(stream_number=1, pcm=b"\x00\x00", client_timestamp_ms=1)
+    sender.send_audio(stream_number=1, pcm=b"\x00\x00", client_timestamp_ms=2)
+
+    transport = FakeTransport()
+    await sender._open(transport)
+
+    assert len(transport.sent_text) == 1
+    assert "session.start" in transport.sent_text[0]
+    assert len(transport.sent_bytes) == 2  # both pending frames resent
+
+
+def test_ack_message_drops_buffered_frames() -> None:
+    sender = _sender(FakeTransport)
+    sender.send_audio(stream_number=1, pcm=b"\x00\x00", client_timestamp_ms=1)  # seq 0
+    sender.send_audio(stream_number=1, pcm=b"\x00\x00", client_timestamp_ms=2)  # seq 1
+    ack = AudioAck(
+        session_id="sess-1",
+        stream_id="mic-01",
+        last_contiguous_sequence=0,
+        timestamp=datetime.now(UTC),
+    )
+    sender._handle_message(ack.model_dump_json())
+    assert len(sender.buffer_for(1)) == 1  # only seq 1 remains
+
+
+def test_error_message_invokes_callback() -> None:
+    received: list[ErrorEvent] = []
+    sender = _sender(FakeTransport, on_error=received.append)
+    error = ErrorEvent(
+        session_id="sess-1",
+        code=ErrorCode.OVERLOADED,
+        message="slow down",
+        retryable=True,
+        timestamp=datetime.now(UTC),
+    )
+    sender._handle_message(error.model_dump_json())
+    assert len(received) == 1
+    assert received[0].code == ErrorCode.OVERLOADED
+
+
+def test_send_audio_unknown_stream_raises() -> None:
+    sender = _sender(FakeTransport)
+    with pytest.raises(KeyError):
+        sender.send_audio(stream_number=99, pcm=b"\x00\x00", client_timestamp_ms=1)
+
+
+def test_on_message_invoked_for_every_parsed_message() -> None:
+    received: list[dict] = []  # type: ignore[type-arg]
+    sender = _sender(FakeTransport, on_message=received.append)
+    ack = AudioAck(
+        session_id="sess-1",
+        stream_id="mic-01",
+        last_contiguous_sequence=0,
+        timestamp=datetime.now(UTC),
+    )
+    sender._handle_message(ack.model_dump_json())
+    error = ErrorEvent(
+        session_id="sess-1",
+        code=ErrorCode.OVERLOADED,
+        message="slow down",
+        retryable=True,
+        timestamp=datetime.now(UTC),
+    )
+    sender._handle_message(error.model_dump_json())
+    sender._handle_message("not json")
+    sender._handle_message(b"binary, ignored")
+
+    assert len(received) == 2
+    assert received[0]["type"] == "audio.ack"
+    assert received[1]["type"] == "error"
+
+
+async def test_open_alone_does_not_report_state() -> None:
+    # _open() only performs the handshake; state transitions are reported
+    # by run() itself (verified below), not by _open() in isolation.
+    states: list[ConnectionState] = []
+    sender = _sender(FakeTransport, on_state_change=states.append)
+    transport = FakeTransport()
+
+    await sender._open(transport)
+
+    assert states == []
+
+
+async def test_run_reports_state_transitions() -> None:
+    stop = asyncio.Event()
+    states: list[ConnectionState] = []
+
+    def factory() -> FakeTransport:
+        return FakeTransport(stop_event=stop, set_stop_on_connect=True)
+
+    sender = _sender(factory, on_state_change=states.append)
+
+    await asyncio.wait_for(sender.run(stop), timeout=2.0)
+
+    assert states == [
+        ConnectionState.CONNECTING,
+        ConnectionState.CONNECTED,
+        ConnectionState.DISCONNECTED,
+    ]
+
+
+async def test_run_reconnects_and_resends_pending() -> None:
+    stop = asyncio.Event()
+    created: list[FakeTransport] = []
+
+    def factory() -> FakeTransport:
+        transport = FakeTransport(
+            stop_event=stop,
+            set_stop_on_connect=(len(created) == 1),
+        )
+        created.append(transport)
+        return transport
+
+    sender = _sender(factory)
+    sender.send_audio(stream_number=1, pcm=b"\x00\x00", client_timestamp_ms=1)
+    sender.send_audio(stream_number=1, pcm=b"\x00\x00", client_timestamp_ms=2)
+
+    await asyncio.wait_for(sender.run(stop), timeout=2.0)
+
+    assert len(created) == 2
+    for transport in created:
+        assert len(transport.sent_text) == 1  # handshake on each connection
+        assert len(transport.sent_bytes) >= 2  # pending frames resent (idempotent)
+        assert transport.closed is True
+
+
+async def test_run_reconnect_after_server_restart_resends_only_unacked_frames() -> None:
+    # Models a server restart: connection #1 acks seq 0 (server persisted it)
+    # before the link drops, so only seq 1 is still pending client-side; a
+    # fresh connection #2 (standing in for the reconnect to a restarted
+    # server, which has no memory of the old session) must only receive the
+    # still-unacked frame, not a blind resend of everything ever sent.
+    stop = asyncio.Event()
+    created: list[FakeTransport] = []
+
+    class _AckThenCloseTransport(FakeTransport):
+        """Connection #1: delivers one ack for seq 0, then the link drops."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._delivered = False
+
+        async def recv(self) -> str | bytes:
+            if not self._delivered:
+                self._delivered = True
+                ack = AudioAck(
+                    session_id="sess-1",
+                    stream_id="mic-01",
+                    last_contiguous_sequence=0,
+                    timestamp=datetime.now(UTC),
+                )
+                return ack.model_dump_json()
+            raise TransportClosed("server restarted")
+
+    def factory() -> FakeTransport:
+        if not created:
+            transport = _AckThenCloseTransport()
+        else:
+            transport = FakeTransport(stop_event=stop, set_stop_on_connect=True)
+        created.append(transport)
+        return transport
+
+    sender = _sender(factory)
+    sender.send_audio(stream_number=1, pcm=b"\x00\x00", client_timestamp_ms=1)  # seq 0
+    sender.send_audio(stream_number=1, pcm=b"\x00\x00", client_timestamp_ms=2)  # seq 1
+
+    await asyncio.wait_for(sender.run(stop), timeout=2.0)
+
+    assert len(created) == 2
+    # Connection #2 (the "restarted server") must only see the still-unacked
+    # seq 1 frame resent, not seq 0 (already acked on connection #1).
+    assert len(created[1].sent_bytes) == 1
+    assert len(sender.buffer_for(1)) == 1  # only seq 1 remains buffered
+
+
+class _BlockingRecvTransport:
+    """A transport whose ``recv()`` never returns on its own.
+
+    Models a real WebSocket with nothing incoming: unlike ``FakeTransport``
+    (which always raises immediately), this only unblocks if cancelled --
+    reproducing what a real connection's ``recv()`` does when idle.
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def connect(self) -> None:
+        pass
+
+    async def send_text(self, data: str, /) -> None:
+        pass
+
+    async def send_bytes(self, data: bytes, /) -> None:
+        pass
+
+    async def recv(self) -> str | bytes:
+        await asyncio.Event().wait()  # never set: blocks until cancelled
+        raise AssertionError("unreachable")
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_run_stops_promptly_even_with_a_permanently_blocked_recv() -> None:
+    # Regression test (WINDOWS-UI-006): a real WebSocket's recv() blocks
+    # until the peer sends something or the connection closes, so a bare
+    # `await transport.recv()` loop never notices `stop` on its own.
+    # Observed in practice as Disconnect appearing to hang, with the
+    # background thread only actually exiting minutes later once the
+    # *server's* own idle timeout force-closed the connection --
+    # SessionController.stop()'s join(timeout=5.0) would give up long
+    # before that and silently orphan the thread. run() must stop well
+    # under that 5s budget purely from `stop` being set, independent of
+    # anything the (blocked) peer does.
+    stop = asyncio.Event()
+    sender = _sender(_BlockingRecvTransport)
+
+    async def _stop_shortly() -> None:
+        await asyncio.sleep(0.1)
+        stop.set()
+
+    asyncio.create_task(_stop_shortly())
+    await asyncio.wait_for(sender.run(stop), timeout=1.0)

@@ -1,0 +1,13 @@
+# Auto-provisions Prometheus as Grafana's default data source so
+# docker-compose.prod.yml's example stack has a working dashboard source
+# out of the box, with no manual Grafana UI configuration required.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true

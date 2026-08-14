@@ -1,0 +1,32 @@
+# Pack Manifest
+
+- `.env.example`
+- `CLAUDE.md`
+- `GPU_MANUAL_WORKFLOW.md`
+- `IMPLEMENTATION_STATUS.md`
+- `LOCAL_WORKFLOW.md`
+- `MANUAL_ACTIONS.md`
+- `README.md`
+- `USER_RESULTS.md`
+- `docs/ACCEPTANCE_CRITERIA.md`
+- `docs/ARCHITECTURE.md`
+- `docs/OPERATOR_RUNBOOK_SEED.md`
+- `docs/PRODUCT_REQUIREMENTS.md`
+- `docs/PROTOCOL.md`
+- `docs/TRANSLATION.md`
+- `prompts/00_MASTER_PROMPT.md`
+- `prompts/BUGFIX_PROMPT_TEMPLATE.md`
+- `prompts/GPU_RESULT_ANALYSIS_PROMPT.md`
+- `prompts/REVIEW_PROMPT.md`
+- `prompts/phases/00_FOUNDATION.md`
+- `prompts/phases/01_CONTRACTS_PROTOCOL.md`
+- `prompts/phases/02_WINDOWS_AUDIO.md`
+- `prompts/phases/03_WEBSOCKET_STREAMING.md`
+- `prompts/phases/04_VAD_UTTERANCE.md`
+- `prompts/phases/05_WHISPER_FINAL.md`
+- `prompts/phases/06_WHISPER_PARTIAL.md`
+- `prompts/phases/07_QWEN_TRANSLATION.md`
+- `prompts/phases/08_COMPLETENESS_ORCHESTRATION.md`
+- `prompts/phases/09_PYSIDE_UI.md`
+- `prompts/phases/10_RELIABILITY_SECURITY_OBSERVABILITY.md`
+- `prompts/phases/11_E2E_PACKAGING.md`

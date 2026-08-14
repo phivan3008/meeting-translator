@@ -1,0 +1,545 @@
+"""PySide6 main window for the meeting-translator client.
+
+The only module in ``client/ui`` (besides ``bootstrap.py``'s thin launcher)
+that imports PySide6. Wires the Qt-independent
+:class:`~client.ui.view_model.ClientViewModel` and
+:class:`~client.ui.session_controller.SessionController` to real widgets and
+real Windows audio capture; contains no protocol/state logic of its own
+(all of that lives in ``view_model.py``/``session_controller.py`` and is
+unit-tested there). Excluded from the CPU test suite -- PySide6 and a real
+audio backend are not available there -- and only exercised manually on
+Windows; see IMPLEMENTATION_STATUS.md for the manual verification
+checklist. Because this file cannot be executed or type-checked against a
+real Qt runtime in this environment, treat it as unverified until that
+manual pass confirms it.
+"""
+
+from __future__ import annotations
+
+import html
+import logging
+import uuid
+from datetime import UTC, datetime
+from typing import Any
+
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QFont
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from client.audio.capture import CaptureContext
+from client.audio.types import DeviceInfo, DropPolicy
+from client.transport.backoff import ReconnectBackoff
+from client.transport.sender import ConnectionState, WebSocketClientTransport
+from client.ui.session_controller import SessionController
+from client.ui.settings_store import SettingsStore, default_settings_path
+from client.ui.view_model import CaptionEntry, ClientViewModel, LanguagePreset
+from shared.protocol.enums import StreamSource
+from shared.protocol.messages import (
+    ErrorEvent,
+    SessionStart,
+    StreamConfig,
+    TranscriptionPartial,
+    TranslationUpdated,
+    UtteranceFinal,
+)
+from shared.settings import get_settings
+
+_LOG = logging.getLogger("client.ui.main_window")
+
+_STREAM_NUMBER = {StreamSource.MICROPHONE: 1, StreamSource.LOOPBACK: 2}
+
+
+class _EventBridge(QObject):  # type: ignore[misc]  # PySide6 has no stubs installed here
+    """Thread-safe cross-thread signal bridge.
+
+    Instantiated on (and lives on) the Qt main thread. The background
+    ``SessionController`` thread calls ``.emit()`` on these signals
+    directly from its own thread; Qt detects that the emitting thread
+    differs from the receiving ``QObject``'s thread and automatically
+    delivers the connected slot call through a queued connection on the
+    main thread's event loop. This is the standard, documented PySide6
+    pattern for a thread-safe worker-to-UI bridge -- no manual locking or
+    queue is needed here.
+    """
+
+    state_changed = Signal(object)
+    event_received = Signal(object)
+    fatal_error = Signal(object)
+
+
+class MainWindow(QMainWindow):  # type: ignore[misc]  # PySide6 has no stubs installed here
+    """The application's single top-level window."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Meeting Translator")
+        self.resize(900, 600)
+
+        self._view_model = ClientViewModel()
+        self._settings_store = SettingsStore(default_settings_path())
+        self._view_model.apply_persisted_settings(self._settings_store.load())
+
+        self._bridge = _EventBridge()
+        self._bridge.state_changed.connect(self._on_state_changed)
+        self._bridge.event_received.connect(self._on_event_received)
+        self._bridge.fatal_error.connect(self._on_fatal_error)
+
+        self._session: SessionController | None = None
+        self._captures: dict[StreamSource, CaptureContext] = {}
+        self._backend_streams: dict[StreamSource, Any] = {}
+        self._backend: Any = None
+        self._caption_items: dict[str, QListWidgetItem] = {}
+        self._caption_labels: dict[str, QLabel] = {}
+
+        self._build_ui()
+        self._refresh_devices()
+        self._apply_view_model_to_controls()
+
+        self._capture_timer = QTimer(self)
+        self._capture_timer.setInterval(20)
+        self._capture_timer.timeout.connect(self._drain_capture)
+
+    # --- UI construction -------------------------------------------------------
+    def _build_ui(self) -> None:
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+
+        top = QHBoxLayout()
+        self._connect_button = QPushButton("Connect")
+        self._connect_button.clicked.connect(self._on_connect_clicked)
+        self._state_label = QLabel(ConnectionState.DISCONNECTED.value)
+        self._refresh_button = QPushButton("Refresh devices")
+        self._refresh_button.clicked.connect(self._refresh_devices)
+        top.addWidget(self._connect_button)
+        top.addWidget(self._state_label)
+        top.addStretch(1)
+        top.addWidget(self._refresh_button)
+        root.addLayout(top)
+
+        devices = QHBoxLayout()
+        self._mic_enabled = QCheckBox("Microphone")
+        self._mic_combo = QComboBox()
+        self._loopback_enabled = QCheckBox("Meeting audio (loopback)")
+        self._loopback_combo = QComboBox()
+        devices.addWidget(self._mic_enabled)
+        devices.addWidget(self._mic_combo, 1)
+        devices.addWidget(self._loopback_enabled)
+        devices.addWidget(self._loopback_combo, 1)
+        root.addLayout(devices)
+
+        self._mic_enabled.toggled.connect(
+            lambda checked: self._on_source_enabled_toggled(StreamSource.MICROPHONE, checked)
+        )
+        self._loopback_enabled.toggled.connect(
+            lambda checked: self._on_source_enabled_toggled(StreamSource.LOOPBACK, checked)
+        )
+        self._mic_combo.currentIndexChanged.connect(
+            lambda _index: self._on_device_selected(StreamSource.MICROPHONE)
+        )
+        self._loopback_combo.currentIndexChanged.connect(
+            lambda _index: self._on_device_selected(StreamSource.LOOPBACK)
+        )
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Language preset:"))
+        self._preset_combo = QComboBox()
+        for preset in LanguagePreset:
+            self._preset_combo.addItem(preset.value, preset)
+        self._preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        preset_row.addWidget(self._preset_combo)
+        preset_row.addStretch(1)
+        root.addLayout(preset_row)
+
+        self._captions = QListWidget()
+        caption_font = QFont()
+        # Accessibility: a somewhat larger default than the platform base
+        # size, since captions are the primary content of this window.
+        caption_font.setPointSize(max(12, caption_font.pointSize() + 2))
+        self._captions.setFont(caption_font)
+        self._captions.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self._captions.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        root.addWidget(self._captions, 1)
+
+        # Keyboard navigation: an explicit, logical tab order through every
+        # interactive control (Qt's default order already follows creation
+        # order, which matches this, but an explicit chain keeps it robust
+        # to future layout changes).
+        self.setTabOrder(self._connect_button, self._refresh_button)
+        self.setTabOrder(self._refresh_button, self._mic_enabled)
+        self.setTabOrder(self._mic_enabled, self._mic_combo)
+        self.setTabOrder(self._mic_combo, self._loopback_enabled)
+        self.setTabOrder(self._loopback_enabled, self._loopback_combo)
+        self.setTabOrder(self._loopback_combo, self._preset_combo)
+        self.setTabOrder(self._preset_combo, self._captions)
+
+    # --- Devices -----------------------------------------------------------
+    def _get_backend(self) -> Any:
+        if self._backend is None:
+            from client.audio.windows_backend import PyAudioWPatchBackend  # noqa: PLC0415
+
+            self._backend = PyAudioWPatchBackend()
+        return self._backend
+
+    def _refresh_devices(self) -> None:
+        try:
+            backend = self._get_backend()
+            inputs = backend.list_input_devices()
+            loopbacks = backend.list_loopback_devices()
+        except Exception as exc:  # noqa: BLE001 - hardware-dependent, surfaced to the user
+            QMessageBox.warning(self, "Device enumeration failed", str(exc))
+            return
+        self._view_model.set_devices(input_devices=inputs, loopback_devices=loopbacks)
+        self._populate_combo(
+            self._mic_combo, inputs, self._view_model.sources[StreamSource.MICROPHONE].device_index
+        )
+        self._populate_combo(
+            self._loopback_combo,
+            loopbacks,
+            self._view_model.sources[StreamSource.LOOPBACK].device_index,
+        )
+
+    @staticmethod
+    def _populate_combo(
+        combo: QComboBox, devices: list[DeviceInfo], selected_index: int | None
+    ) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+        for device in devices:
+            combo.addItem(f"[{device.index}] {device.name}", device)
+        if selected_index is not None:
+            for i in range(combo.count()):
+                data = combo.itemData(i)
+                if data is not None and data.index == selected_index:
+                    combo.setCurrentIndex(i)
+                    break
+        combo.blockSignals(False)
+
+    def _apply_view_model_to_controls(self) -> None:
+        vm = self._view_model
+        self._mic_enabled.setChecked(vm.sources[StreamSource.MICROPHONE].enabled)
+        self._loopback_enabled.setChecked(vm.sources[StreamSource.LOOPBACK].enabled)
+        index = self._preset_combo.findData(vm.preset)
+        if index >= 0:
+            self._preset_combo.setCurrentIndex(index)
+
+    def _on_source_enabled_toggled(self, source: StreamSource, checked: bool) -> None:
+        self._view_model.set_source_enabled(source, checked)
+        self._save_settings()
+
+    def _on_device_selected(self, source: StreamSource) -> None:
+        combo = self._mic_combo if source is StreamSource.MICROPHONE else self._loopback_combo
+        device = combo.currentData()
+        self._view_model.select_device(source, device)
+        self._save_settings()
+
+    def _on_preset_changed(self, _index: int) -> None:
+        preset = self._preset_combo.currentData()
+        if isinstance(preset, LanguagePreset):
+            self._view_model.apply_preset(preset)
+            self._save_settings()
+
+    def _save_settings(self) -> None:
+        try:
+            self._settings_store.save(self._view_model.to_persisted_settings())
+        except OSError:
+            pass  # persistence is a convenience; a write failure must not block the UI
+
+    # --- Connect / disconnect ------------------------------------------------
+    def _on_connect_clicked(self) -> None:
+        if self._session is not None:
+            self._stop_session()
+        else:
+            self._start_session()
+
+    def _start_session(self) -> None:
+        vm = self._view_model
+        streams: list[StreamConfig] = []
+        for source in (StreamSource.MICROPHONE, StreamSource.LOOPBACK):
+            config = vm.sources[source]
+            if not config.enabled:
+                continue
+            if config.device_index is None:
+                QMessageBox.warning(
+                    self,
+                    "No device selected",
+                    f"Select a device for {source.value} or disable it.",
+                )
+                return
+            stream_id = f"{source.value}-01"
+            vm.register_stream(source, stream_id)
+            streams.append(
+                StreamConfig(
+                    stream_number=_STREAM_NUMBER[source],
+                    stream_id=stream_id,
+                    source=source,
+                    source_language=config.source_language,
+                    target_language=config.target_language,
+                )
+            )
+        if not streams:
+            QMessageBox.warning(
+                self, "No source enabled", "Enable at least one source before connecting."
+            )
+            return
+
+        session_start = SessionStart(
+            session_id=f"meeting-{uuid.uuid4().hex[:12]}",
+            client_id=f"client-{uuid.uuid4().hex[:8]}",
+            timestamp=datetime.now(UTC),
+            streams=streams,
+        )
+
+        settings = get_settings()
+        url = settings.client_server_url
+
+        session = SessionController(
+            session_start=session_start,
+            transport_factory=lambda: WebSocketClientTransport(url),
+            backoff=ReconnectBackoff(
+                initial_ms=settings.reconnect_backoff_initial_ms,
+                max_ms=settings.reconnect_backoff_max_ms,
+                multiplier=settings.reconnect_backoff_multiplier,
+            ),
+            buffer_capacity=settings.client_outbound_buffer_frames,
+            on_state_change=self._bridge.state_changed.emit,
+            on_event=self._bridge.event_received.emit,
+            on_fatal_error=self._bridge.fatal_error.emit,
+        )
+
+        try:
+            self._start_capture(streams)
+        except Exception as exc:  # noqa: BLE001 - hardware-dependent, surfaced to the user
+            QMessageBox.critical(self, "Capture failed", str(exc))
+            self._stop_capture()
+            return
+
+        self._session = session
+        session.start()
+        # The capture-drain timer is intentionally NOT started here -- see
+        # _drain_capture's docstring. It starts on the first CONNECTED
+        # state instead (_on_state_changed).
+        self._connect_button.setText("Disconnect")
+
+    def _start_capture(self, streams: list[StreamConfig]) -> None:
+        backend = self._get_backend()
+        for stream_config in streams:
+            source = stream_config.source
+            device_index = self._view_model.sources[source].device_index
+            if device_index is None:
+                continue
+            # `open_stream` needs `on_chunk` before the resulting stream's
+            # `audio_format` (needed to construct the CaptureContext) is
+            # known. A per-iteration holder dict, bound into the callback
+            # as a default argument (evaluated once, at definition time),
+            # avoids the classic late-binding closure-in-a-loop bug.
+            holder: dict[str, CaptureContext] = {}
+
+            def _on_chunk(
+                data: bytes, ts_ms: int, _holder: dict[str, CaptureContext] = holder
+            ) -> None:
+                _holder["context"].on_raw_chunk(data, ts_ms)
+
+            backend_stream = backend.open_stream(
+                device_index=device_index,
+                source=source,
+                on_chunk=_on_chunk,
+                frames_per_buffer=1024,
+            )
+            context = CaptureContext(
+                stream_number=stream_config.stream_number,
+                source=source,
+                source_format=backend_stream.audio_format,
+                drop_policy=DropPolicy.DROP_OLDEST,
+            )
+            holder["context"] = context
+            backend_stream.start()
+            self._captures[source] = context
+            self._backend_streams[source] = backend_stream
+            _LOG.info(
+                "capture started: source=%s device_index=%s stream_number=%s "
+                "sample_rate=%s channels=%s",
+                source.value,
+                device_index,
+                stream_config.stream_number,
+                backend_stream.audio_format.sample_rate,
+                backend_stream.audio_format.channels,
+            )
+        if not self._captures:
+            _LOG.warning(
+                "no capture stream started -- every enabled source lacked a "
+                "device_index (check device selection before Connect)"
+            )
+
+    def _stop_capture(self) -> None:
+        for backend_stream in self._backend_streams.values():
+            backend_stream.stop()
+            backend_stream.close()
+        self._backend_streams.clear()
+        self._captures.clear()
+
+    def _stop_session(self) -> None:
+        self._capture_timer.stop()
+        self._stop_capture()
+        if self._session is not None:
+            self._session.stop()
+            self._session = None
+        self._connect_button.setText("Connect")
+        self._view_model.set_connection_state(ConnectionState.DISCONNECTED)
+        self._state_label.setText(ConnectionState.DISCONNECTED.value)
+
+    def _drain_capture(self) -> None:
+        """Send captured frames -- only actually runs once connected.
+
+        Deliberately not started until the first ``CONNECTED`` state (see
+        ``_on_state_changed``), not immediately after ``session.start()``:
+        starting it earlier let ``send_audio()`` run (and queue packets)
+        before the WebSocket handshake completed, which meant those
+        already-queued packets got sent once via ``AudioSender``'s
+        reconnect-oriented resend-pending step (intended for real
+        reconnects, not first connects) and then sent *again* once the
+        normal outgoing pump started -- a real, observed bug
+        (`WINDOWS-UI-005`'s server log showed spurious "lost packets
+        (jitter overflow)" warnings on an otherwise healthy first
+        connection, consistent with this extra burst of duplicate traffic
+        tripping the jitter buffer's bounded reorder window). Capture
+        itself (into ``CaptureContext``'s bounded queue) still starts
+        immediately in ``_start_capture`` -- only sending is deferred --
+        so at most a short, harmless amount of audio is buffered (and
+        drop-oldest if the connect takes unusually long) rather than lost
+        track of.
+        """
+        session = self._session
+        if session is None:
+            return
+        try:
+            for context in self._captures.values():
+                for frame in context.process_available():
+                    session.send_audio(
+                        stream_number=frame.stream_number,
+                        pcm=frame.pcm,
+                        client_timestamp_ms=frame.capture_timestamp_ms,
+                    )
+        except RuntimeError:
+            # The background session thread died between ticks (e.g. a
+            # connection failure that exhausted this run) -- stop cleanly
+            # instead of raising the same error on every 20ms tick.
+            _LOG.warning("session died mid-capture; stopping")
+            self._stop_session()
+
+    # --- Cross-thread event handling (main-thread slots) ----------------------
+    def _on_state_changed(self, state: object) -> None:
+        if not isinstance(state, ConnectionState):
+            return
+        self._view_model.set_connection_state(state)
+        self._state_label.setText(state.value)
+        if state is ConnectionState.CONNECTED and self._session is not None:
+            # Safe to call every time we (re)connect: QTimer.start() on an
+            # already-running timer just keeps it running. See
+            # _drain_capture's docstring for why this waits for CONNECTED
+            # rather than starting right after session.start().
+            self._capture_timer.start()
+
+    def _on_fatal_error(self, error: object) -> None:
+        if not isinstance(error, BaseException):
+            return
+        self._stop_session()
+        QMessageBox.critical(self, "Connection failed", str(error) or type(error).__name__)
+
+    def _on_event_received(self, event: object) -> None:
+        known_types = (TranscriptionPartial, UtteranceFinal, TranslationUpdated, ErrorEvent)
+        if not isinstance(event, known_types):
+            return
+        entry = self._view_model.handle_event(event)
+        if entry is not None:
+            self._render_caption_entry(entry)
+
+    # --- Caption rendering ---------------------------------------------------
+    def _render_caption_entry(self, entry: CaptionEntry) -> None:
+        item = self._caption_items.get(entry.utterance_id)
+        label = self._caption_labels.get(entry.utterance_id)
+        if item is None or label is None:
+            item = QListWidgetItem()
+            label = QLabel()
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setWordWrap(True)
+            self._captions.addItem(item)
+            self._captions.setItemWidget(item, label)
+            self._caption_items[entry.utterance_id] = item
+            self._caption_labels[entry.utterance_id] = label
+
+        label.setText(_caption_html(entry))
+        item.setSizeHint(label.sizeHint())
+        self._captions.scrollToItem(item)
+
+    # --- Lifecycle -------------------------------------------------------------
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._save_settings()
+        if self._session is not None:
+            self._stop_session()
+        super().closeEvent(event)
+
+
+def _caption_html(entry: CaptionEntry) -> str:
+    """Render one caption entry as rich text.
+
+    Distinguishes: a gray partial hint with stable text in a darker shade
+    than the lighter, italicized unstable tail; a bold final transcription;
+    a normal-weight translation line below it; and a colored retry/failure
+    line when applicable.
+    """
+    direction = ""
+    if entry.source is not None:
+        direction = f"{entry.source.value}: {entry.source_language.value}"
+        if entry.target_language is not None:
+            direction += f" -> {entry.target_language.value}"
+    header_text = f"{html.escape(direction)} {html.escape(entry.timestamp)}"
+    header = f"<span style='color:#888888;font-size:small'>{header_text}</span>"
+
+    if entry.is_final:
+        body = f"<b>{html.escape(entry.transcription)}</b>"
+    else:
+        stable = f"<span style='color:#666666'>{html.escape(entry.stable_text)}</span>"
+        unstable = ""
+        if entry.unstable_text:
+            unstable_text = html.escape(entry.unstable_text)
+            unstable = f"<span style='color:#aaaaaa;font-style:italic'>{unstable_text}</span>"
+        body = stable + unstable
+
+    lines = [header, body]
+    if entry.translation:
+        lines.append(f"<span style='font-weight:normal'>{html.escape(entry.translation)}</span>")
+    if entry.error_message:
+        color = "#cc8800" if entry.retryable else "#cc0000"
+        label = "Retrying" if entry.retryable else "Failed"
+        lines.append(
+            f"<span style='color:{color}'>{label}: {html.escape(entry.error_message)}</span>"
+        )
+    return "<br>".join(line for line in lines if line)
+
+
+def run() -> int:
+    """Launch the real caption UI and return the Qt exit code."""
+    import sys  # noqa: PLC0415
+
+    from PySide6.QtWidgets import QApplication  # noqa: PLC0415
+
+    from shared.logging import configure_logging  # noqa: PLC0415
+
+    configure_logging(get_settings().log_level)
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    return int(app.exec())

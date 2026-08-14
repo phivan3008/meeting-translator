@@ -1,0 +1,47 @@
+# Local Docker Compose skeleton for the Meeting Translator application server.
+#
+# This is a LOCAL skeleton only. Do NOT run GPU services (vLLM, faster-whisper)
+# on a remote GPU host from here. The GPU model server is launched manually on
+# the GPU host per GPU_MANUAL_WORKFLOW.md. Services requiring a GPU are shown
+# for reference under the "gpu" profile and are intentionally not started by
+# default.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  server:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+    command:
+      - uvicorn
+      - server.app:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+
+  # Reference only. Launch manually on the GPU host; not started by default.
+  vllm:
+    image: vllm/vllm-openai:latest
+    profiles: ["gpu"]
+    environment:
+      - MODEL_PATH=/models/Qwen3.6-27B-FP8
+    ports:
+      - "8000:8000"
+    # Real GPU deployment is documented in the operator runbook and executed
+    # manually. This entry exists for reference and must not be run locally.

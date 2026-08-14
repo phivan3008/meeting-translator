@@ -1,0 +1,132 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meeting-translator"
+version = "0.1.0"
+description = "Near-real-time Vietnamese-Japanese meeting transcription and translation."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+# Core runtime dependencies shared by client and server domain logic.
+# These must remain importable on a Linux CPU environment without GPU,
+# Qt, CUDA or model weights.
+dependencies = [
+    "pydantic>=2.6,<3",
+    "pydantic-settings>=2.2,<3",
+]
+
+[project.optional-dependencies]
+# Application server (FastAPI gateway, transport). No GPU imports here.
+server = [
+    "fastapi>=0.110,<1",
+    "uvicorn[standard]>=0.29,<1",
+    "websockets>=12,<13",
+    "redis>=5,<6",
+    "httpx>=0.27,<1",
+    "numpy>=1.26,<3",
+    "PyJWT[crypto]>=2.8,<3",
+    "prometheus-client>=0.20,<1",
+]
+
+# Windows client UI. Not imported by CPU test suite.
+client = [
+    "PySide6>=6.6,<7",
+    "numpy>=1.26,<3",
+    "websockets>=12,<13",
+]
+
+# Windows-only audio capture. Installed and exercised manually on Windows.
+windows-audio = [
+    "PyAudioWPatch>=0.2.12.7",
+]
+
+# GPU-only inference stack. Installed and exercised manually on the GPU host.
+gpu = [
+    "faster-whisper>=1.0,<2",
+    "silero-vad>=5,<6",
+    "vllm",
+]
+
+# Windows client packaging (PyInstaller). Installed manually alongside the
+# client/windows-audio extras to build a distributable .exe; not needed to
+# run or test the project otherwise.
+packaging = [
+    "pyinstaller>=6,<7",
+]
+
+# Local development tooling for formatting, linting, typing and testing.
+dev = [
+    "ruff>=0.4,<1",
+    "mypy>=1.9,<2",
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.23,<1",
+    "httpx>=0.27,<1",
+    "fastapi>=0.110,<1",
+    "pydantic>=2.6,<3",
+    "pydantic-settings>=2.2,<3",
+    "numpy>=1.26,<3",
+    "PyJWT[crypto]>=2.8,<3",
+    "prometheus-client>=0.20,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["client*", "server*", "shared*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".local_backups", ".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "W",   # pycodestyle warnings
+    "C4",  # comprehensions
+]
+ignore = []
+
+[tool.ruff.lint.isort]
+known-first-party = ["client", "server", "shared"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+plugins = ["pydantic.mypy"]
+exclude = "(^|/)(\\.local_backups|build|dist|deployment)/"
+
+# Client UI depends on PySide6, which is not installed in the CPU test/type
+# environment. Keep the domain logic strictly typed and treat Qt as external.
+[[tool.mypy.overrides]]
+module = ["PySide6.*", "pyaudiowpatch.*", "websockets.*", "silero_vad.*", "torch.*", "faster_whisper.*"]
+ignore_missing_imports = true
+
+# numpy 2.x ships type stubs that use Python 3.12-only syntax, which conflicts
+# with the 3.11 target. Skip following numpy stubs; treat numpy as external.
+[[tool.mypy.overrides]]
+module = ["numpy.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "gpu: tests that require a GPU host and model weights (run manually).",
+    "windows_audio: tests that require Windows audio hardware (run manually).",
+]

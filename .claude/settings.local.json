@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m pip list 2>&1 | Select-Object -First 40)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m pip install -e \".[dev]\" 2>&1 | Select-Object -Last 30)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe scripts\\\\local_backup.py --label phase-06)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m ruff format . 2>&1)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m ruff check . 2>&1)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m mypy client server shared 2>&1)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m pytest -q -m \"not gpu and not windows_audio\" 2>&1 | Select-Object -Last 100)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m pytest -q -m \"not gpu and not windows_audio\" tests/test_asr_partial.py::test_previous_text_conditioning_uses_committed_text -rA 2>&1 | Select-Object -Last 60)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m ruff format . 2>&1; & .\\\\.venv\\\\Scripts\\\\python.exe -m ruff check . 2>&1; & .\\\\.venv\\\\Scripts\\\\python.exe -m mypy client server shared 2>&1)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m pytest -q -m \"not gpu and not windows_audio\" 2>&1 | Select-Object -Last 60)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m pytest -q tests/test_transport_sender.py -p no:randomly 2>&1 | Select-Object -Last 40)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m pytest -q tests/test_transport_sender.py::test_run_reconnects_and_resends_pending 2>&1)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m pytest -q -m \"not gpu and not windows_audio\" --tb=no 2>&1 | Select-Object -Last 15)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m pytest -m \"not gpu and not windows_audio\" --deselect tests/test_transport_sender.py::test_run_reconnects_and_resends_pending -q 2>&1 | Select-Object -Last 10)",
+      "PowerShell(Out-Null *)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m pytest tests/test_transport_sender.py::test_run_reconnects_and_resends_pending -q -s --tb=long -o log_cli=true --log-cli-level=DEBUG 2>&1 | Select-Object -Last 80)",
+      "PowerShell(& \"F:\\\\workspaces\\\\fpt\\\\projects\\\\whalelm\\\\Realtime-meeting-translator-v2\\\\meeting-translator\\\\.venv\\\\Scripts\\\\python.exe\" \"C:\\\\Users\\\\Admin\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\F--workspaces-fpt-projects-whalelm-Realtime-meeting-translator-v2-meeting-translator\\\\e17f753e-1271-4ef1-81fc-479d0bb88ea2\\\\scratchpad\\\\debug_sender.py\")",
+      "PowerShell(& \"F:\\\\workspaces\\\\fpt\\\\projects\\\\whalelm\\\\Realtime-meeting-translator-v2\\\\meeting-translator\\\\.venv\\\\Scripts\\\\python.exe\" \"C:\\\\Users\\\\Admin\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\F--workspaces-fpt-projects-whalelm-Realtime-meeting-translator-v2-meeting-translator\\\\e17f753e-1271-4ef1-81fc-479d0bb88ea2\\\\scratchpad\\\\debug_minimal.py\")",
+      "PowerShell(& \"F:\\\\workspaces\\\\fpt\\\\projects\\\\whalelm\\\\Realtime-meeting-translator-v2\\\\meeting-translator\\\\.venv\\\\Scripts\\\\python.exe\" \"C:\\\\Users\\\\Admin\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\F--workspaces-fpt-projects-whalelm-Realtime-meeting-translator-v2-meeting-translator\\\\e17f753e-1271-4ef1-81fc-479d0bb88ea2\\\\scratchpad\\\\debug_minimal_fix.py\")",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe scripts\\\\local_backup.py --label sender-cancel-race-fix)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m pytest -q -m \"not gpu and not windows_audio\" tests/test_transport_sender.py 2>&1 | Select-Object -Last 20)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m pytest -q -m \"not gpu and not windows_audio\" 2>&1 | Select-Object -Last 15)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m pytest -q -m \"not gpu and not windows_audio\" --tb=no 2>&1 | Select-Object -Last 5; echo \"EXIT=$LASTEXITCODE\")",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe scripts\\\\local_backup.py --label phase-07)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\python.exe -m pytest -q -m \"not gpu and not windows_audio\" --tb=short 2>&1 | Select-Object -Last 150)"
+    ]
+  }
+}

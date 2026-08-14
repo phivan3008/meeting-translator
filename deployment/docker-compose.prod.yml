@@ -1,0 +1,97 @@
+# Production-like Docker Compose example: application server, Redis,
+# Prometheus + Grafana monitoring, and an external vLLM translation
+# backend.
+#
+# Differs from docker-compose.yml (the local dev skeleton) by adding the
+# monitoring stack and treating the translation GPU backend as a real
+# external dependency (VLLM_BASE_URL, supplied via ../.env) rather than a
+# reference-only "gpu" profile entry. As with docker-compose.yml, GPU
+# services (vLLM, faster-whisper) are NEVER started by this file -- they
+# run on a separately managed GPU host per GPU_MANUAL_WORKFLOW.md; this
+# compose file only *connects* to that already-running server.
+#
+# TLS termination is also NOT included here -- see docs/DEPLOYMENT.md for
+# the reverse-proxy layer that belongs in front of this stack. This file
+# is what sits behind it.
+#
+# Before running: copy .env.example to .env at the repository root, set
+# JWT_PUBLIC_KEY_PATH/VLLM_BASE_URL/APP_ENV=production for a real
+# deployment (docs/SECURITY.md's pre-deployment checklist), and change
+# GRAFANA_ADMIN_PASSWORD below from its placeholder.
+#
+# Usage:
+#   docker compose -f deployment/docker-compose.prod.yml up -d
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+
+  server:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+    command:
+      - uvicorn
+      - server.app:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+    healthcheck:
+      # Uses the base image's own python (no extra tooling needed in the
+      # slim image) to hit the real readiness endpoint added in Phase 10.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://localhost:8080/health/ready', timeout=3).status==200 else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - server
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    environment:
+      # CHANGE ME before any real deployment -- this is a placeholder, not
+      # a real credential (docs/SECURITY.md: no secrets committed to
+      # source; treat this the same way and override it at deploy time).
+      - GF_SECURITY_ADMIN_PASSWORD=__CHANGE_ME__
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:

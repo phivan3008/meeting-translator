@@ -1,0 +1,15 @@
+# Prometheus scrape config for docker-compose.prod.yml's example stack.
+# Scrapes the real /metrics endpoint added in Phase 10
+# (server/observability/metrics.py) -- Prometheus text format, no auth of
+# its own (see docs/SECURITY.md's checklist on restricting network access
+# to this endpoint in a real deployment).
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: meeting-translator-server
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["server:8080"]
