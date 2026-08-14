@@ -4,101 +4,18 @@ Claude ghi các thao tác mà người dùng cần thực hiện tại đây.
 
 ## Pending actions
 
-One action to re-run the GPU end-to-end test (`GPU-E2E-003`) now that the
-rebuilt vLLM server reports no errors, plus one action from Phase 11's
-original staging (`LATENCY-001`, on hold -- see below). Neither is
-required to close out Phase 11's own local scope. `WINDOWS-PACKAGE-001`,
-`GPU-E2E-001`, `GPU-E2E-002` and `GPU-TRANSLATE-008` have all PASSED --
-see "Completed actions" below (`GPU-TRANSLATE-008`'s pass is on the
-user's word only, without the specific verification output requested --
-see its entry for detail; `GPU-E2E-003` will independently confirm or
-refute it).
-
-### Action ID: GPU-E2E-003
-
-- Status: WAITING_FOR_USER
-- Purpose: `GPU-TRANSLATE-008` rebuilt the translation GPU environment
-  from scratch and the user reports it completed with no traceback/error,
-  but without pasting the specific `/health`/`/v1/models`/`nvidia-smi`
-  values requested -- so this hasn't been independently verified yet, per
-  `CLAUDE.md`'s "never assume a manual command succeeded". Re-run
-  `tests/test_e2e_gpu.py` (same test as `GPU-E2E-001`) to get a real,
-  self-contained answer: it exercises the actual translation path through
-  this project's own code and prints the real `translation_status`/
-  `translation` values, which will conclusively show whether the rebuilt
-  server works or not, independent of what wasn't pasted for
-  `GPU-TRANSLATE-008`.
-- Run on: The ASR GPU host, `.venv-asr` (already has `faster-whisper`
-  installed from `GPU-E2E-001`'s attempt 2 -- no new installs needed).
-- Prerequisites: Same venv as `GPU-E2E-001`/`GPU-E2E-002`. `VLLM_BASE_URL`
-  should already resolve to `http://localhost:8000/v1` (confirmed in
-  `GPU-E2E-002`) -- only relevant if `.venv-translate`'s vLLM server is on
-  a different host than `.venv-asr`, in which case re-check it.
-- Safety notes: Read-only against the GPU (a decode + a translation
-  request). Does not restart, stop or reconfigure anything.
-- Commands:
-  ```bash
-  cd /workspace/meeting-translator   # adjust to the real path on this host
-  source .venv-asr/bin/activate
-  pytest -m gpu tests/test_e2e_gpu.py -v -s
-  ```
-- Expected success indicators: The test passes (as it did in `GPU-E2E-001`
-  either way, since its assertion is loose), but this time look at the
-  printed `translation_status` and `translation` lines specifically --
-  `translation_status: <TranslationStatus.COMPLETED: 'completed'>` with a
-  non-`None`, real-looking `translation` string means the rebuild actually
-  fixed it. `FAILED` again means something is still wrong and needs
-  further diagnosis (a repeat of `GPU-E2E-002`-style investigation, not
-  assumed to be the same cause).
-  Expected artifacts: None persisted; test output only.
-- Rollback or cleanup: None needed.
-- Return to Claude:
-  - Full pytest output, especially the `transcription`/`translation_status`/
-    `translation` lines.
-  - Pass/fail/skip status.
-
-### Action ID: LATENCY-001
-
-- Status: WAITING_FOR_USER (**on hold** -- do not run until `GPU-E2E-003`
-  confirms `translation_status: COMPLETED` with real translated text;
-  running it now would measure latency against a translation backend not
-  yet confirmed working)
-- Purpose: Get the first-ever *real* hardware latency numbers for this
-  project -- every latency measurement so far (Phase 11's local smoke
-  runs of `scripts/latency_report.py`) has been against fake backends.
-  Compare the results to `docs/PRODUCT_REQUIREMENTS.md` section 5's
-  objectives (VAD speech-start p95 < 250ms, first partial p95 < 1.8s,
-  final ASR p95 < 1.2s, translation p95 < 1.2s, end-to-end final p95 <
-  3.5s -- noting `latency_report.py` does not isolate VAD speech-start or
-  precise translation-only latency; see its own docstring).
-- Run on: On or near the GPU host(s) (low network latency to both
-  faster-whisper and vLLM matters for a meaningful reading) -- the same
-  environment as `GPU-E2E-001` is a reasonable choice.
-- Prerequisites: Same as `GPU-E2E-001` (`faster-whisper` installed,
-  reachable vLLM server, this project's source + `dev` extra installed).
-- Safety notes: Read-only; generates real but synthetic (sine-tone) load
-  against both backends for the duration of the run (default 20
-  utterances, a few minutes) -- not a stress test, ordinary single-stream
-  load.
-- Commands:
-  ```bash
-  cd /workspace/meetting-translator   # adjust to the real path on this host
-  source .venv-asr/bin/activate
-  python scripts/latency_report.py --count 20 --real-backends --json
-  ```
-- Expected success indicators: The script completes and prints a JSON
-  report with real, non-zero `asr_final_ms`/`end_to_end_ms`/
-  `first_partial_ms` percentiles. There is no pass/fail built into the
-  tool itself -- "success" here means getting real numbers to compare
-  against the documented objectives by hand.
-  Expected artifacts: None persisted; console output only (redirect to a
-  file if you want to keep it, e.g. `> latency-report.json`).
-- Rollback or cleanup: None needed.
-- Return to Claude:
-  - Exact command used and exit status.
-  - The full JSON (or table) output.
-  - Any error output (secrets/hostnames redacted per
-    `GPU_MANUAL_WORKFLOW.md`).
+None. All manual actions staged so far -- including the full three
+originally staged by Phase 11 (`WINDOWS-PACKAGE-001`, the `GPU-E2E-*`
+series, and `LATENCY-001`) plus the `GPU-TRANSLATE-008` rebuild and its
+diagnostics -- have PASSED. See "Completed actions" below. Real hardware
+latency numbers now exist for the first time in this project
+(`LATENCY-001`), with one genuine finding: measured translation p95
+(2392.1ms) exceeds `docs/PRODUCT_REQUIREMENTS.md`'s <1.2s objective,
+plausibly due to `--enforce-eager` (required to work around the
+`flashinfer` bug) disabling `torch.compile`/CUDA graphs -- not yet
+root-caused with certainty. No further manual action is currently
+`WAITING_FOR_USER`; do not begin new GPU-server work without the user's
+explicit direction, per the standing instruction.
 
 ## Completed actions
 
@@ -190,13 +107,69 @@ refute it).
   accidental deletion) -- redo of `GPU-TRANSLATE-002` through
   `GPU-TRANSLATE-006` from scratch.
 - Run on: The translation GPU host, new `.venv-translate`.
-- Note: Recorded as PASSED on the user's confirmation per this project's
-  practice of accepting terse "no traceback/error" confirmations (see
-  `WINDOWS-UI-007`'s precedent), but per `CLAUDE.md`'s "never assume a
-  manual command succeeded," this specific result carries a caveat since
-  none of the requested return values were provided. `GPU-E2E-003`
-  provides independent, self-contained proof either way by exercising the
-  real translation path and printing the actual result.
+- Note: Attempt 2's missing verification detail was re-sent (2026-08-15):
+  `/health` returned `http_status=200`; `/v1/models` matched
+  `GPU-TRANSLATE-006` exactly (`qwen3.6-27b-translate`,
+  `max_model_len=4096`); `nvidia-smi` showed `75909 MiB / 81559 MiB` used,
+  consistent with weights + KV cache, no OOM. This is now fully,
+  independently verified -- the earlier caveat no longer applies.
+  `GPU-E2E-003` (below) then confirmed real translation actually works
+  end-to-end.
+
+### Action ID: GPU-E2E-003
+
+- Status: PASSED (2026-08-15) -- real, meaningful pass: translation
+  actually succeeded, not just the test's loose assertion being
+  technically satisfied.
+- Result summary: `1 passed in 11.02s`, no traceback.
+  `transcription: 'ご視聴ありがとうございました'` (same expected
+  Whisper hallucination on synthetic-tone input as `GPU-E2E-001`).
+  `translation_status: <TranslationStatus.COMPLETED: 'completed'>`.
+  `translation: 'Cảm ơn quý vị đã theo dõi.'` -- a correct, fluent
+  Vietnamese translation of "thank you for watching," matching the
+  Japanese source's meaning exactly.
+- Purpose: Re-run `tests/test_e2e_gpu.py` (same test as `GPU-E2E-001`)
+  after `GPU-TRANSLATE-008`'s rebuild, to independently confirm real
+  translation now works end-to-end rather than relying on the user's
+  unelaborated confirmation alone.
+- Run on: The ASR GPU host, `.venv-asr`.
+- Note: This is the first real, hardware-confirmed proof that the full
+  pipeline -- real `WhisperAsrModel` decode, real `VllmTranslationClient`
+  translation, both through the real `UtteranceOrchestrator` -- works
+  end-to-end on real GPU hardware. `GPU-E2E-001`'s original
+  translation-failure finding is fully resolved.
+
+### Action ID: LATENCY-001
+
+- Status: PASSED (2026-08-15) -- the tool's own success criterion (real,
+  non-zero percentiles obtained); one real, unresolved finding below.
+- Result summary: 20 real runs against real backends
+  (`python scripts/latency_report.py --count 20 --real-backends --json`):
+  `first_partial_ms` p50=766.7/p95=934.3/p99=3249.6ms,
+  `asr_final_ms` p50=92.0/p95=94.2/p99=96.4ms,
+  `end_to_end_ms` p50=2317.6/p95=2484.0/p99=4593.1ms,
+  `translation_ms_approx` p50=2225.5/p95=2392.1/p99=4517.9ms. Against
+  `docs/PRODUCT_REQUIREMENTS.md` section 5's objectives: first partial
+  p95 (934.3ms < 1.8s) PASSES; final ASR p95 (94.2ms < 1.2s) PASSES
+  comfortably; **translation p95 (2392.1ms) FAILS the <1.2s objective**,
+  roughly 2x over budget; end-to-end final p95 (2484.0ms < 3.5s) PASSES,
+  though p99 (4593.1ms) exceeds 3.5s. VAD speech-start p95 was not
+  measured (documented tool limitation).
+- Purpose: Get the first-ever real hardware latency numbers for this
+  project.
+- Run on: GPU server, `.venv-asr`.
+- Note: **First real hardware latency data for this project.** The
+  translation-latency miss is plausibly explained by `--enforce-eager`
+  (required to work around the `flashinfer` `array.array[int]` bug --
+  see `GPU-TRANSLATE-003`/`004`), which disables `torch.compile`/CUDA
+  graph capture, already flagged at the time as "slower inference, not a
+  correctness issue" -- this is the first measurement quantifying that
+  cost, though not root-caused with certainty (no A/B measurement against
+  a non-eager launch exists). Also: these numbers come from a single
+  short, fixed synthetic utterance repeated 20 times, not a realistic
+  distribution of meeting utterance lengths or concurrent load -- a first
+  data point, not a comprehensive benchmark. Full detail in
+  `USER_RESULTS.md`'s `LATENCY-001` entry.
 
 ### Action ID: WINDOWS-UI-007
 

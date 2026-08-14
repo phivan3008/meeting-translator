@@ -1879,43 +1879,40 @@ section covers what was built and how it was verified.
   - The `translation_queue_depth` Gauge cross-session-sharing limitation
     (found by this phase's own load test) is newly documented, not fixed
     -- see "Phase 11 deliverables"'s last bullet.
-  - Of the three genuinely hardware-dependent verifications staged in
-    `MANUAL_ACTIONS.md`, `WINDOWS-PACKAGE-001` (launch the packaged `.exe`
-    on real Windows hardware with real audio and a real/dev server
-    connection) has PASSED (2026-08-14), and `GPU-E2E-001`
-    (`tests/test_e2e_gpu.py` on the GPU host) has PASSED its own
-    assertions (2026-08-14) but surfaced a real, unresolved finding: the
-    real translation leg against the real vLLM server FAILED
-    (`translation_status: FAILED`, `translation: None`) -- the ASR half
-    genuinely worked (real GPU decode, real latency recorded; the
-    hallucinated transcription text on the synthetic sine-tone input is
-    expected, not a defect), but end-to-end real-hardware translation is
-    NOT yet confirmed working, despite `GPU-TRANSLATE-007` separately
-    confirming the vLLM server itself could translate correctly back on
-    2026-08-12. See `USER_RESULTS.md`'s `GPU-E2E-001` entries for detail.
-    A diagnostic, `GPU-E2E-002`, PASSED (2026-08-14) and conclusively
-    found the root cause: not a config bug (`vllm_base_url` resolved
-    correctly), not a client bug (`VllmTranslationClient` correctly
-    classified the connection failure), simply that the vLLM server from
-    `GPU-TRANSLATE-005` was not running on this host. The user then found
-    the deeper cause: `models/` (the downloaded `Qwen3.6-27B-FP8` weights)
-    and `.venv-translate` had both been accidentally deleted from the GPU
-    host. `GPU-TRANSLATE-008` redid the full setup from scratch (venv,
-    weights re-download, vLLM reinstall, the venv-scoped `flashinfer`
-    patch -- needed again on this fresh install, and Claude's first patch
-    script attempt had its own bug, self-defeatingly trying to *import*
-    the broken module to locate it; corrected on retry) and PASSED
-    (2026-08-14), though only on the user's word -- the specific
-    `/health`/`/v1/models`/`nvidia-smi` output requested was not pasted,
-    so per `CLAUDE.md`'s "never assume a manual command succeeded" this
-    isn't independently confirmed yet. `GPU-E2E-003` (re-running
-    `tests/test_e2e_gpu.py`) is staged and `WAITING_FOR_USER` in
-    `MANUAL_ACTIONS.md` to get that independent confirmation -- it prints
-    the real `translation_status`/`translation` values from the actual
-    translation path. `LATENCY-001` stays on hold until `GPU-E2E-003`
-    confirms `translation_status: COMPLETED` with real text -- measuring
-    latency against a translation backend not yet confirmed working would
-    produce misleading numbers.
+  - All three genuinely hardware-dependent verifications staged in
+    `MANUAL_ACTIONS.md` have now PASSED. `WINDOWS-PACKAGE-001` (launch
+    the packaged `.exe` on real Windows hardware) PASSED 2026-08-14.
+    `GPU-E2E-001`'s first run (2026-08-14) surfaced a real translation
+    failure (`translation_status: FAILED`) against the real vLLM server,
+    root-caused by `GPU-E2E-002` to the vLLM server simply not running,
+    then further traced by the user to `models/` (the `Qwen3.6-27B-FP8`
+    weights) and `.venv-translate` both having been accidentally deleted
+    from the GPU host. `GPU-TRANSLATE-008` redid that setup from scratch
+    (including hitting and fixing a bug in Claude's own first
+    `flashinfer`-patch script, which self-defeatingly tried to *import*
+    the broken module to locate it) and was independently verified
+    working (`/health` 200, `/v1/models` matching `GPU-TRANSLATE-006`
+    exactly, `nvidia-smi` showing no OOM). `GPU-E2E-003` then re-ran the
+    full pipeline and PASSED meaningfully: `translation_status: COMPLETED`
+    with a real, correct Vietnamese translation
+    (`'Cảm ơn quý vị đã theo dõi.'`) -- **the first real, hardware-confirmed
+    proof that real ASR and real translation work together end-to-end on
+    real GPU hardware.** `LATENCY-001` then ran and produced this
+    project's **first-ever real hardware latency numbers**
+    (`scripts/latency_report.py --count 20 --real-backends`): first
+    partial p95 934.3ms (< 1.8s objective, PASSES), final ASR p95 94.2ms
+    (< 1.2s, PASSES comfortably), end-to-end final p95 2484.0ms (< 3.5s,
+    PASSES, though p99 4593.1ms exceeds it), and **translation p95
+    2392.1ms -- FAILS the documented < 1.2s objective by roughly 2x**.
+    This is a real, new, unresolved finding: plausibly explained by
+    `--enforce-eager` (required to work around the `flashinfer` bug)
+    disabling `torch.compile`/CUDA graph capture, but not root-caused with
+    certainty (no A/B measurement against a non-eager launch exists), and
+    measured against a single short synthetic utterance rather than a
+    realistic distribution of meeting utterances or concurrent load. Full
+    detail in `USER_RESULTS.md`'s `LATENCY-001` entry and
+    `MANUAL_ACTIONS.md`'s completed-actions section. No manual action is
+    currently `WAITING_FOR_USER`.
   - UI acceptance criteria about partial/final/translation *rendering*
     (gray hint, bold final, normal-weight translation, retry/failure
     visibility) remain LOCAL_VERIFIED only, not screen-verified with real
@@ -1956,55 +1953,55 @@ consistent with the standing "do not proceed to another phase without
 direction" instruction, which applies here as much as ever precisely
 *because* this was the last titled phase.
 
-Of the three staged hardware-dependent manual actions, `WINDOWS-PACKAGE-001`
-(run the already-built packaged Windows client on real hardware) has
-PASSED (2026-08-14): the user built a fresh venv, ran a real PyInstaller
-build, and confirmed the `.exe` launches, shows real device dropdowns, and
-Connect/Disconnect works cleanly against a local dev server with a
-Vietnamese-speech WAV playing for the loopback path -- no traceback or
-exception. See `MANUAL_ACTIONS.md`'s completed-actions entry and
-`USER_RESULTS.md` for the full result. This is a UI/connectivity check
-only, not evidence of live captions.
+**All three of Phase 11's staged hardware-dependent manual actions have
+now PASSED**, closing out that staging entirely:
 
-`GPU-E2E-001` (`tests/test_e2e_gpu.py` on the GPU host) has since PASSED
-its own assertions (2026-08-14, after a first attempt correctly SKIPPED
-due to a missing `faster-whisper` install in a fresh venv -- Claude's own
-error in the originally prepared commands, fixed in the retry). The ASR
-half is confirmed working on real hardware (real GPU decode, real
-recorded latency). But it surfaced a real, unresolved finding: the real
-translation leg FAILED against the real vLLM server
-(`translation_status: FAILED`, `translation: None`), despite
-`GPU-TRANSLATE-007` separately confirming that same server could
-translate correctly on 2026-08-12. The follow-up diagnostic,
-`GPU-E2E-002`, PASSED (2026-08-14) and conclusively found why: not a
-config bug, not a client bug -- the vLLM server from `GPU-TRANSLATE-005`
-was simply not running on this host. The user then found the deeper
-cause: `models/` (the `Qwen3.6-27B-FP8` weights) and `.venv-translate`
-had both been accidentally deleted from the GPU host. `GPU-TRANSLATE-008`
-redid the full setup from scratch, including hitting and fixing a bug in
-Claude's own first flashinfer-patch script (it tried to *import* the
-broken module to locate it, which is exactly what triggers the crash it
-was patching -- corrected on retry to locate the file by filesystem glob
-instead), and PASSED (2026-08-14) -- though only on the user's word, not
-against the specific `/health`/`/v1/models`/`nvidia-smi` output requested,
-so this isn't independently confirmed. `GPU-E2E-003` (re-running
-`tests/test_e2e_gpu.py`, staged and `WAITING_FOR_USER` in
-`MANUAL_ACTIONS.md`) will get that independent confirmation by printing
-the real `translation_status`/`translation` values. `LATENCY-001` (still
-deliberately on hold) waits for `GPU-E2E-003` to confirm
-`translation_status: COMPLETED` with real text -- measuring latency
-against a translation backend not yet confirmed working would produce
-misleading numbers. The user instructed Claude not to connect to or
-operate the GPU server itself and to prepare only the next manual command
-set each time; `GPU-E2E-003` is that next command set. None of these
-remaining actions' results are required to close out Phase 11's own local
-scope. Do not begin any further work (these staged actions beyond
-preparing the next
-command set, the gateway-wiring gap, or anything else) without the user's
-explicit direction. Take a local snapshot first
-(`python scripts/local_backup.py --label <name>`) -- as the very first
-action, before any reading/research -- before starting whichever the user
-chooses next.
+- `WINDOWS-PACKAGE-001` (2026-08-14): the packaged Windows client `.exe`
+  launches, shows real device dropdowns, and Connect/Disconnect works
+  cleanly against a local dev server -- a UI/connectivity check, not
+  evidence of live captions.
+- `GPU-E2E-001` (2026-08-14) initially surfaced a real translation
+  failure against the real vLLM server. `GPU-E2E-002` root-caused it to
+  the vLLM server simply not running; the user then found the deeper
+  cause -- `models/` (the `Qwen3.6-27B-FP8` weights) and `.venv-translate`
+  had both been accidentally deleted from the GPU host. `GPU-TRANSLATE-008`
+  rebuilt everything from scratch (also catching and fixing a bug in
+  Claude's own first flashinfer-patch script, which self-defeatingly
+  tried to *import* the broken module to locate it) and was independently
+  verified (`/health` 200, `/v1/models` matching `GPU-TRANSLATE-006`
+  exactly, no OOM per `nvidia-smi`). `GPU-E2E-003` then re-ran the full
+  pipeline and PASSED meaningfully: `translation_status: COMPLETED` with
+  a correct real translation -- **the first real, hardware-confirmed
+  proof that ASR and translation work together end-to-end on real GPU
+  hardware.**
+- `LATENCY-001` (2026-08-15) then produced this project's **first-ever
+  real hardware latency numbers**. Three of four measured objectives
+  pass; **translation p95 (2392.1ms) fails the documented <1.2s
+  objective by roughly 2x**, plausibly due to `--enforce-eager` (the
+  flashinfer workaround) disabling `torch.compile`/CUDA graphs, though
+  not root-caused with certainty. See `USER_RESULTS.md`'s `LATENCY-001`
+  entry for the full breakdown.
+
+Full detail for all of the above is in `MANUAL_ACTIONS.md`'s
+completed-actions section and `USER_RESULTS.md`. **No manual action is
+currently `WAITING_FOR_USER`.**
+
+This closes out everything Phase 11 originally staged. What's left is
+unchanged from before and remains the natural next topic to raise with
+the user, not to start unprompted: **"the one gap that matters most"** --
+`UtteranceOrchestrator` is still not wired into the live gateway, so a
+real client connected to a real running server today will not produce
+live captions, despite every individual piece (including the newly
+end-to-end-confirmed real ASR+translation chain) now being real and
+tested. A secondary, lower-priority open item is the measured translation
+p95 latency miss above, which may be worth investigating (e.g., whether
+an upstream `flashinfer` fix exists that would allow removing
+`--enforce-eager`) before any latency-sensitive production commitment.
+Do not begin either without the user's explicit direction, per the
+standing "do not proceed without direction" instruction. Take a local
+snapshot first (`python scripts/local_backup.py --label <name>`) -- as
+the very first action, before any reading/research -- before starting
+whichever the user chooses next.
 
 ---
 

@@ -952,6 +952,111 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   values, which will conclusively show whether the rebuilt vLLM server
   actually works, independent of whatever wasn't pasted here.
 
+### GPU-TRANSLATE-008 (verification detail, re-sent)
+
+- Date: 2026-08-15
+- Environment: GPU server, `.venv-translate`, following attempt 2's
+  successful patch + relaunch.
+- Command summary:
+  - `curl .../health`
+  - `curl .../v1/models`
+  - `nvidia-smi --query-gpu=memory.used,memory.total --format=csv`
+- Exit status: no traceback/error/exception.
+- Result: PASSED -- now independently verified against the specific
+  requested output (previously recorded as "on the user's word only").
+- Relevant output summary:
+  - `/health`: `http_status=200`.
+  - `/v1/models`: `id=qwen3.6-27b-translate`,
+    `root=/workspace/meeting-translator/models/Qwen3.6-27B-FP8`,
+    `max_model_len=4096` -- matches `GPU-TRANSLATE-006`'s original launch
+    exactly.
+  - `nvidia-smi`: `75909 MiB / 81559 MiB` used -- consistent with weights
+    (~27.67 GiB) + KV cache both resident (slightly higher than
+    `GPU-TRANSLATE-005`'s original `72237 MiB`, within normal variance),
+    no OOM.
+- Redacted raw output file, if any: none.
+- Follow-up: `GPU-TRANSLATE-008` is now fully confirmed, not just
+  reported. See `GPU-E2E-003` below for the real end-to-end proof this
+  motivated, which also passed.
+
+### GPU-E2E-003
+
+- Date: 2026-08-15
+- Environment: GPU server, `.venv-asr`.
+- Command summary: `pytest -m gpu tests/test_e2e_gpu.py -v -s`
+- Exit status: `1 passed in 11.02s`, no traceback.
+- Result: PASSED -- and this time meaningfully: real translation
+  succeeded, not just the test's loose assertion being technically
+  satisfied.
+- Relevant output summary:
+  - `transcription: 'ご視聴ありがとうございました'` (same expected
+    Whisper hallucination on the synthetic sine-tone input as `GPU-E2E-001`).
+  - `translation_status: <TranslationStatus.COMPLETED: 'completed'>`.
+  - `translation: 'Cảm ơn quý vị đã theo dõi.'` -- a correct, fluent
+    Vietnamese translation of "thank you for watching" (matches the
+    Japanese source's meaning exactly).
+- Redacted raw output file, if any: none.
+- Follow-up: This is the first real, hardware-confirmed proof that the
+  full pipeline -- real `WhisperAsrModel` decode, real
+  `VllmTranslationClient` translation, both through the real
+  `UtteranceOrchestrator` -- works end-to-end on real GPU hardware.
+  `GPU-E2E-001`'s original translation-failure finding is now fully
+  resolved (root cause was the missing `models/`/`.venv-translate`,
+  fixed by `GPU-TRANSLATE-008`). `LATENCY-001` can now proceed
+  meaningfully.
+
+### LATENCY-001
+
+- Date: 2026-08-15
+- Environment: GPU server, `.venv-asr`.
+- Command summary:
+  `python scripts/latency_report.py --count 20 --real-backends --json`
+- Exit status: no traceback/error/exception; produced a well-formed JSON
+  report.
+- Result: PASSED (the tool's own success criterion -- real, non-zero
+  percentiles were obtained; there is no pass/fail threshold built into
+  the tool itself).
+- Relevant output summary (20 real runs against real `WhisperAsrModel` +
+  real `VllmTranslationClient`):
+  | metric | p50 | p95 | p99 | max |
+  |---|---|---|---|---|
+  | first_partial_ms | 766.7 | 934.3 | 3249.6 | 3828.4 |
+  | asr_final_ms | 92.0 | 94.2 | 96.4 | 97.0 |
+  | end_to_end_ms | 2317.6 | 2484.0 | 4593.1 | 5120.4 |
+  | translation_ms_approx | 2225.5 | 2392.1 | 4517.9 | 5049.4 |
+
+  Compared against `docs/PRODUCT_REQUIREMENTS.md` section 5's objectives:
+  - First partial p95 < 1.8s: **934.3ms -- PASSES.**
+  - Final ASR p95 < 1.2s: **94.2ms -- PASSES comfortably** (a very short
+    synthetic utterance decodes fast on an idle H100).
+  - Translation p95 < 1.2s: **2392.1ms -- FAILS**, roughly 2x over
+    budget. This is the first real signal that translation latency does
+    not currently meet the documented objective.
+  - End-to-end final p95 < 3.5s: **2484.0ms -- PASSES**, but p99
+    (4593.1ms) exceeds 3.5s -- a real tail-latency concern even though
+    the stated p95 objective is met.
+  - VAD speech-start p95 < 250ms: not measured by this tool (documented
+    limitation of `latency_report.py` -- it does not isolate VAD
+    speech-start latency).
+- Redacted raw output file, if any: none.
+- Follow-up: **Real, first-ever hardware latency data for this project.**
+  The translation-latency miss is plausibly explained by
+  `--enforce-eager` (required to work around the `flashinfer`
+  `array.array[int]` import bug -- see `GPU-TRANSLATE-003`/`004`'s
+  history), which disables `torch.compile`/CUDA graph capture and was
+  already flagged at the time as "slower inference, not a correctness
+  issue" -- this is the first measurement that quantifies that cost.
+  Not root-caused with certainty here (no A/B measurement against a
+  non-eager launch was taken, since that would require resolving the
+  `flashinfer` bug upstream or finding another workaround). Also
+  noteworthy: these numbers come from a single short, fixed synthetic
+  utterance repeated 20 times, not a realistic distribution of meeting
+  utterance lengths or concurrent sessions -- read as a first data point,
+  not a comprehensive benchmark. This is genuinely useful signal for
+  anyone deciding whether to invest in resolving the `flashinfer` bug
+  upstream (to re-enable `torch.compile`) before treating this project as
+  production-ready for translation latency.
+
 ## Result template
 
 ```markdown
