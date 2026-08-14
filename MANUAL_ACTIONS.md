@@ -17,7 +17,24 @@ simply wasn't running, which the user then traced to the underlying
 
 ### Action ID: GPU-TRANSLATE-008
 
-- Status: WAITING_FOR_USER
+- Status: WAITING_FOR_USER (steps 1-5 completed successfully; step 6's
+  patch script failed on attempt 1 -- see below; corrected script is
+  what's shown now)
+- Attempt 1 result (2026-08-14): Steps 1-4 (recreate venv, re-download
+  weights, install vLLM, confirm no process) all reported OK. Step 5's
+  launch hit the expected flashinfer `array.array[int]` TypeError. Step
+  6's patch script itself then crashed with the *same* `TypeError`,
+  because it tried to locate the broken file by running
+  `import flashinfer.comm.fd_exchange as m` -- but importing that module
+  is exactly what evaluates the broken annotation and crashes, so the
+  import failed before the file could even be read, let alone patched.
+  Root cause: Claude's own mistake in the originally prepared script
+  (this specific patch script wasn't verified before being handed out,
+  unlike the rest of this project's commands). Corrected below by
+  locating the file via a filesystem glob under `.venv-translate/lib/`
+  instead of importing it -- the traceback itself already confirmed the
+  real path (`.venv-translate/lib/python3.11/site-packages/flashinfer/
+  comm/fd_exchange.py`), so this is not a guess.
 - Purpose: Originally staged as a simple restart, but the user has since
   confirmed both `models/` (containing the downloaded `Qwen3.6-27B-FP8`
   weights from `GPU-TRANSLATE-002`) and `.venv-translate` are gone from
@@ -102,18 +119,27 @@ simply wasn't running, which the user then traced to the underlying
   #    "array.array' is not subscriptable" -- expected on a fresh
   #    install, per GPU-TRANSLATE-003/004's history), patch it directly,
   #    matching GPU-TRANSLATE-005's fix, then relaunch.
+  #    IMPORTANT: locate the file by path, NOT by importing
+  #    flashinfer.comm.fd_exchange -- importing it is exactly what
+  #    triggers the crash (the broken annotation is evaluated at import
+  #    time), so an import-based locator fails with the same TypeError
+  #    instead of patching anything (this happened on the first attempt
+  #    -- Claude's own mistake in the originally prepared script).
   grep -q "is not subscriptable" vllm_serve.log && python3 - << 'EOF'
   import re
-  import flashinfer.comm.fd_exchange as m
   from pathlib import Path
-  path = Path(m.__file__)
-  text = path.read_text()
-  pattern = r'(?<!["\'])array\.array\[int\](?!["\'])'
-  if re.search(pattern, text):
-      path.write_text(re.sub(pattern, '"array.array[int]"', text))
-      print("patched OK")
+  candidates = list(Path(".venv-translate/lib").glob("python3.*/site-packages/flashinfer/comm/fd_exchange.py"))
+  if not candidates:
+      print("fd_exchange.py not found under .venv-translate/lib -- report back, don't guess further")
   else:
-      print("pattern not found -- file may differ from GPU-TRANSLATE-005's; do not guess further, report back")
+      path = candidates[0]
+      text = path.read_text()
+      pattern = r'(?<!["\'])array\.array\[int\](?!["\'])'
+      if re.search(pattern, text):
+          path.write_text(re.sub(pattern, '"array.array[int]"', text))
+          print(f"patched OK: {path}")
+      else:
+          print(f"pattern not found in {path} -- may already be patched or differ from expected, report back")
   EOF
   # If "patched OK" printed, relaunch (repeat step 5's nohup command,
   # then re-check the log the same way).

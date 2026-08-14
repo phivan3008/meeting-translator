@@ -892,6 +892,41 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   server so `GPU-E2E-001` and `LATENCY-001` can be meaningfully re-run
   afterward.
 
+### GPU-TRANSLATE-008 (attempt 1)
+
+- Date: 2026-08-14
+- Environment: GPU server, freshly recreated `.venv-translate`.
+- Command summary: steps 1-4 (venv creation, `huggingface_hub` install,
+  weights re-download, `pip install vllm`, `pgrep` check) then step 5
+  (`nohup vllm serve ...`) then step 6 (flashinfer patch script).
+- Exit status: steps 1-4 reported OK by the user with no further detail
+  requested. Step 5's server process crashed on the known flashinfer
+  import-time bug. Step 6's patch script itself raised an uncaught
+  `TypeError`.
+- Result: FAILED at step 6 (patch script bug, not a server/environment
+  problem) -- user correctly stopped and reported back rather than
+  guessing further.
+- Relevant output summary: Step 6's traceback:
+  ```
+  File "/workspace/meeting-translator/.venv-translate/lib/python3.11/site-packages/flashinfer/comm/fd_exchange.py", line 55, in <module>
+      def _fd_ancillary(fd: int) -> tuple[tuple[int, int, array.array[int]]]:
+  TypeError: type 'array.array' is not subscriptable
+  ```
+  raised from `import flashinfer.comm.fd_exchange as m` inside the patch
+  script itself (visible via the `flashinfer/comm/__init__.py` ->
+  `trtllm_ar.py` -> `mnnvl.py` -> `fd_exchange.py` import chain in the
+  traceback), not from the vLLM server process.
+- Redacted raw output file, if any: none.
+- Follow-up: Root cause is a mistake in the patch script Claude prepared,
+  not anything the user did wrong or a new server-side issue. Locating
+  the broken file by importing it is self-defeating, since importing it
+  is exactly what triggers the bug. Corrected in `MANUAL_ACTIONS.md`'s
+  `GPU-TRANSLATE-008` to locate the file via a filesystem glob under
+  `.venv-translate/lib/` instead (the failed attempt's own traceback
+  already confirmed the real path, so this isn't a guess). The
+  `Qwen3.6-27B-FP8` re-download and `vllm` install themselves are not
+  known to be a problem -- only the patch step needs retrying.
+
 ## Result template
 
 ```markdown
