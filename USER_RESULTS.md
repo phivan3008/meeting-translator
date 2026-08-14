@@ -815,6 +815,47 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   reach the already-running vLLM server over HTTP). See
   `MANUAL_ACTIONS.md`'s updated `GPU-E2E-001` for the retry commands.
 
+### GPU-E2E-001 (attempt 2, retry)
+
+- Date: 2026-08-14
+- Environment: GPU server, same `.venv-asr` as attempt 1 plus `pip install
+  "faster-whisper>=1.0,<2"`.
+- Command summary:
+  - `pip install "faster-whisper>=1.0,<2"`
+  - `python -c "import faster_whisper; print(...)"`
+  - `pytest -m gpu tests/test_e2e_gpu.py -v -s`
+- Exit status: `faster_whisper 1.2.1` printed; pytest `1 passed in 11.13s`.
+- Result: PASSED by the test's own (deliberately loose) assertions, but
+  with a real, unresolved finding -- see follow-up.
+- Relevant output summary:
+  - `transcription: 'ご視聴ありがとうございました'` -- a well-known
+    faster-whisper/Whisper hallucination on non-speech input (this
+    Japanese phrase, "thank you for watching", is a documented artifact
+    the model produces on silence/synthetic tones with no real speech).
+    Expected given the test's synthetic sine-tone input; not a defect,
+    and consistent with the test's own docstring (content accuracy on a
+    synthetic tone is explicitly not asserted).
+  - `translation_status: <TranslationStatus.FAILED: 'failed'>`
+  - `translation: None`
+  - The test passed only because its own assertion is
+    `final_event.translation_status is not None` when transcription is
+    non-empty -- `FAILED` satisfies "is not None", so this is not
+    evidence the translation leg actually worked.
+- Redacted raw output file, if any: none.
+- Follow-up: **Real, unresolved finding**: the translation leg genuinely
+  failed against the real vLLM server, for one of several possible
+  reasons the test itself cannot distinguish (the wire protocol's
+  `UtteranceFinal` message does not carry the internal
+  `TranslationOutcome.issue`/reason string, only `translation_status`) --
+  circuit breaker open, request timeout, vLLM unreachable/down since
+  `GPU-TRANSLATE-005`, `VLLM_BASE_URL` unset or wrong in this venv/host
+  (this may be a different pod/session than the one `GPU-TRANSLATE-005`
+  -`007` ran on), or a validation-failure reason (`server/translation/
+  worker.py`'s `validate_translation`). Do not run `LATENCY-001` yet --
+  measuring latency against a broken translation backend would produce
+  misleading numbers. `GPU-E2E-002` (see `MANUAL_ACTIONS.md`) is a small,
+  read-only diagnostic to narrow this down before proceeding.
+
 ## Result template
 
 ```markdown

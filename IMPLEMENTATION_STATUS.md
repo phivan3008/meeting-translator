@@ -1882,15 +1882,23 @@ section covers what was built and how it was verified.
   - Of the three genuinely hardware-dependent verifications staged in
     `MANUAL_ACTIONS.md`, `WINDOWS-PACKAGE-001` (launch the packaged `.exe`
     on real Windows hardware with real audio and a real/dev server
-    connection) has now PASSED (2026-08-14; see `USER_RESULTS.md`). Two
-    remain `WAITING_FOR_USER`: `GPU-E2E-001` (run `tests/test_e2e_gpu.py`
-    on the GPU host against the already-confirmed-working `large-v3`/vLLM
-    setup) and `LATENCY-001` (run `scripts/latency_report.py
-    --real-backends` on/near the GPU host for genuine p50/p95/p99 numbers
-    to compare against `docs/PRODUCT_REQUIREMENTS.md` section 5's
-    objectives -- this project has never yet measured those objectives
-    against real hardware, only characterized the measurement tool itself
-    locally).
+    connection) has PASSED (2026-08-14), and `GPU-E2E-001`
+    (`tests/test_e2e_gpu.py` on the GPU host) has PASSED its own
+    assertions (2026-08-14) but surfaced a real, unresolved finding: the
+    real translation leg against the real vLLM server FAILED
+    (`translation_status: FAILED`, `translation: None`) -- the ASR half
+    genuinely worked (real GPU decode, real latency recorded; the
+    hallucinated transcription text on the synthetic sine-tone input is
+    expected, not a defect), but end-to-end real-hardware translation is
+    NOT yet confirmed working, despite `GPU-TRANSLATE-007` separately
+    confirming the vLLM server itself could translate correctly back on
+    2026-08-12. See `USER_RESULTS.md`'s `GPU-E2E-001` entries for detail.
+    A new diagnostic, `GPU-E2E-002`, is staged and `WAITING_FOR_USER` in
+    `MANUAL_ACTIONS.md` to narrow down why (dead/unreachable vLLM process,
+    misconfigured `VLLM_BASE_URL` on this host/venv, or a real client
+    bug). `LATENCY-001` is deliberately on hold until `GPU-E2E-002`
+    resolves this -- measuring latency against a translation backend
+    already known to be failing would produce misleading numbers.
   - UI acceptance criteria about partial/final/translation *rendering*
     (gray hint, bold final, normal-weight translation, retry/failure
     visibility) remain LOCAL_VERIFIED only, not screen-verified with real
@@ -1941,18 +1949,28 @@ exception. See `MANUAL_ACTIONS.md`'s completed-actions entry and
 `USER_RESULTS.md` for the full result. This is a UI/connectivity check
 only, not evidence of live captions.
 
-Two remain `WAITING_FOR_USER` in `MANUAL_ACTIONS.md`: `GPU-E2E-001` (run
-the new `tests/test_e2e_gpu.py` on the GPU host) and `LATENCY-001` (run
-`scripts/latency_report.py --real-backends` for the first-ever real
-hardware latency numbers against `docs/PRODUCT_REQUIREMENTS.md`'s
-objectives). The user instructed Claude not to connect to or operate the
-GPU server itself and to prepare only the next manual command set;
-`GPU-E2E-001` is presented next (it was staged first and logically
-precedes `LATENCY-001`, since a working correctness check on the GPU path
-is a more useful thing to confirm before spending a run on latency
-numbers). Neither result is required to close out Phase 11's own local
-scope. Do not begin any further work (these two staged actions beyond
-preparing the next
+`GPU-E2E-001` (`tests/test_e2e_gpu.py` on the GPU host) has since PASSED
+its own assertions (2026-08-14, after a first attempt correctly SKIPPED
+due to a missing `faster-whisper` install in a fresh venv -- Claude's own
+error in the originally prepared commands, fixed in the retry). The ASR
+half is confirmed working on real hardware (real GPU decode, real
+recorded latency). But it surfaced a real, unresolved finding: the real
+translation leg FAILED against the real vLLM server
+(`translation_status: FAILED`, `translation: None`), despite
+`GPU-TRANSLATE-007` separately confirming that same server could
+translate correctly on 2026-08-12 -- something has changed or is
+misconfigured since then (dead process, wrong `VLLM_BASE_URL` on this
+venv/host, or a real client bug; the wire protocol doesn't carry the
+internal failure reason, so this isn't yet known). `GPU-E2E-002`, a
+small read-only diagnostic to pin that down, is now staged and
+`WAITING_FOR_USER` in `MANUAL_ACTIONS.md`. `LATENCY-001` is deliberately
+on hold until `GPU-E2E-002` resolves this -- measuring latency against a
+translation backend already known to be failing would produce misleading
+numbers. The user instructed Claude not to connect to or operate the GPU
+server itself and to prepare only the next manual command set each time;
+`GPU-E2E-002` is that next command set. Neither remaining action's result
+is required to close out Phase 11's own local scope. Do not begin any
+further work (these staged actions beyond preparing the next
 command set, the gateway-wiring gap, or anything else) without the user's
 explicit direction. Take a local snapshot first
 (`python scripts/local_backup.py --label <name>`) -- as the very first

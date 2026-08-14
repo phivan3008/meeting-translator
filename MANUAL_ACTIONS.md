@@ -4,86 +4,103 @@ Claude ghi các thao tác mà người dùng cần thực hiện tại đây.
 
 ## Pending actions
 
-Two actions staged by Phase 11 (end-to-end tests and Windows packaging),
-neither required to close out that phase's own local scope -- Claude is
-waiting for the user's direction on whether/when to run them, per the
-standing "do not proceed to another phase without direction" instruction.
-`WINDOWS-PACKAGE-001` (the third staged action) has PASSED -- see
-"Completed actions" below.
+One diagnostic action (`GPU-E2E-002`) plus one action from Phase 11's
+original staging (`LATENCY-001`, on hold -- see below). Neither is
+required to close out Phase 11's own local scope. `WINDOWS-PACKAGE-001`
+and `GPU-E2E-001` have both PASSED -- see "Completed actions" below
+(`GPU-E2E-001`'s pass carries a real caveat that motivated `GPU-E2E-002`).
 
-### Action ID: GPU-E2E-001
+### Action ID: GPU-E2E-002
 
-- Status: WAITING_FOR_USER (attempt 1 SKIPPED -- see below; this is the
-  corrected retry)
-- Purpose: Run the new optional GPU end-to-end test
-  (`tests/test_e2e_gpu.py`) for the first time -- proves the real
-  `WhisperAsrModel` and real `VllmTranslationClient` work correctly when
-  driven together through a real `UtteranceOrchestrator`, not just each in
-  isolation (which `GPU-ASR-004`/`GPU-ASR-005` and
-  `GPU-TRANSLATE-006`/`GPU-TRANSLATE-007` already separately confirmed).
-- Attempt 1 result (2026-08-14): SKIPPED (`1 skipped in 0.36s`), not a
-  pass. Root cause: Claude's own error, not the user's -- the previously
-  prepared command set only ran `pip install -e ".[dev]"` in a freshly
-  created `.venv-asr`, but `faster-whisper` lives behind `pyproject.toml`'s
-  separate `gpu` extra, not `dev`, so it was never installed and the
-  test's own `faster_whisper`-availability skip-marker correctly fired.
-  Full detail in `USER_RESULTS.md`'s `GPU-E2E-001 (attempt 1)` entry.
-  Fixed below by installing `faster-whisper` directly. Also noted: the
-  pytest output's own `rootdir` printed as `/workspace/meeting-translator`
-  (single "t"), not the `/workspace/meetting-translator` (double "t")
-  path this and prior GPU actions' prepared commands used as a
-  placeholder -- adjust the `cd` below to whatever this host's actual
-  path is; do not assume either spelling.
-- Run on: The ASR GPU host (needs `faster-whisper`/`ctranslate2` and the
-  already-downloaded `large-v3` weights, per `GPU-ASR-004`), with network
-  reachability to the already-running vLLM server from `GPU-TRANSLATE-005`
-  (same host or different -- `VllmTranslationClient` only needs `httpx`,
-  not the `vllm` package itself, to make requests).
-- Prerequisites: This project's source present on that host. `pip install
-  -e ".[dev]"` plus `pip install "faster-whisper>=1.0,<2"` in the venv (the
-  `.venv-asr` created in attempt 1 already has `dev` installed, so only
-  the second command is strictly needed there) so `pytest` and this
-  project's own packages are available; `VLLM_BASE_URL` set (in that
-  environment's `.env` or exported) pointing at the running vLLM server
-  from `GPU-TRANSLATE-005` -- confirm that server is still actually
-  running (e.g. `curl -s -o /dev/null -w "%{http_code}" $VLLM_BASE_URL/health`
-  or the equivalent `/health` check from `GPU-TRANSLATE-006`) before
-  running the test, since it may have been stopped since that session.
-- Safety notes: Read-only against the GPU (a decode + a translation
-  request, nothing destructive); does not restart, stop or reconfigure
-  anything. No secrets are echoed by the test itself.
+- Status: WAITING_FOR_USER
+- Purpose: `GPU-E2E-001` passed its own (deliberately loose) assertions,
+  but the real translation leg it exercised actually FAILED against the
+  real vLLM server (`translation_status: FAILED`, `translation: None`) --
+  a genuine, unresolved finding, not a test-tooling gap. The wire
+  protocol's `UtteranceFinal` message doesn't carry the internal failure
+  reason, only the status, so this action gets that reason directly:
+  confirm the vLLM server from `GPU-TRANSLATE-005` is actually still
+  running and reachable at whatever `VLLM_BASE_URL` this venv/host
+  resolves to, and get a real translation request's actual error (if any)
+  straight from the server side. Do not run `LATENCY-001` until this is
+  resolved -- latency numbers against a broken translation backend would
+  be misleading.
+- Run on: Same host/venv as `GPU-E2E-001`'s attempt 2 (the `.venv-asr` with
+  `faster-whisper` installed), or wherever the vLLM server from
+  `GPU-TRANSLATE-005` is actually running if that's a different host.
+- Prerequisites: Same venv as `GPU-E2E-001`. No new installs needed.
+- Safety notes: Read-only -- a `/health`/`/v1/models` check (matching
+  `GPU-TRANSLATE-006`'s precedent) plus one real chat-completion request
+  through the project's own prompt builder (matching `GPU-TRANSLATE-007`'s
+  precedent). Does not restart, stop or reconfigure anything.
 - Commands:
   ```bash
   cd /workspace/meeting-translator   # adjust to the real path on this host
   source .venv-asr/bin/activate       # or the equivalent venv
-  pip install -e ".[dev]"
-  pip install "faster-whisper>=1.0,<2"
-  python -c "import faster_whisper; print('faster_whisper', faster_whisper.__version__)"
-  pytest -m gpu tests/test_e2e_gpu.py -v -s
+
+  # 1. What does this venv's .env actually resolve vllm_base_url to?
+  #    (Settings reads it from .env directly -- a shell $VLLM_BASE_URL may
+  #    be unset even if .env has it, so resolve it in Python, not bash.)
+  RESOLVED_URL=$(python -c "from shared.settings import Settings; print(Settings().vllm_base_url)")
+  echo "resolved vllm_base_url=$RESOLVED_URL"
+  BASE_URL=${RESOLVED_URL%/v1}   # /health and /v1/models both hang off the root, not /v1
+
+  # 2. Is the vLLM server process still running (may be on a different host)?
+  pgrep -fa "vllm serve" || echo "no vllm serve process found on this host"
+
+  # 3. Health/model check against the actually-resolved URL.
+  curl -s -o /dev/null -w "http_status=%{http_code}\n" "$BASE_URL/health" || echo "unreachable"
+  curl -s "$BASE_URL/v1/models"
+
+  # 4. One real translation request with the actual error surfaced, not swallowed.
+  cat > /tmp/translate_diag.py << 'EOF'
+  import asyncio
+  from server.translation.types import TranslationConfig
+  from server.translation.client import VllmTranslationClient
+  from shared.settings import Settings
+
+  async def main() -> None:
+      settings = Settings()
+      config = TranslationConfig.from_settings(settings)
+      print(f"vllm_base_url={config.base_url!r} model={config.model!r}")
+      client = VllmTranslationClient(config)
+      try:
+          text = await client.complete_chat(
+              system_prompt="Translate Japanese to Vietnamese. Output only the translation.",
+              user_content="こんにちは",
+              max_tokens=64,
+          )
+          print(f"OK: {text!r}")
+      except Exception as exc:
+          print(f"ERROR: {type(exc).__name__}: {exc}")
+      finally:
+          await client.aclose()
+
+  asyncio.run(main())
+  EOF
+  PYTHONPATH=/workspace/meeting-translator python /tmp/translate_diag.py
   ```
-- Expected success indicators: The `python -c` import check prints a
-  version with no error. The test passes; printed output shows a real
-  `asr_final_ms >= 0` and (if the synthetic tone produced any non-empty
-  transcription) a `translation_status` other than `None`. A skip (not a
-  pass) still means `faster_whisper` wasn't importable in that
-  environment -- if it recurs after the explicit install above, paste the
-  full `pip install "faster-whisper>=1.0,<2"` output, since that would be
-  a new, different problem. A failure with an `AsrOutOfMemoryError` or a
-  translation `OVERLOADED` error is itself useful signal (see
-  `docs/OPERATOR_RUNBOOK_SEED.md`'s "Whisper or vLLM OOM response"), not
-  necessarily a bug in the test.
-  Expected artifacts: None persisted; test output only.
-- Rollback or cleanup: None needed.
-- Return to Claude:
-  - Exact command used and exit status.
-  - Full pytest output (the printed `transcription`/`translation_status`/
-    `translation` lines especially).
-  - `nvidia-smi` summary if anything looked like resource pressure.
-  - Any observed error.
+- Expected success indicators: Step 1 prints a non-empty URL. Step 2 shows
+  a running `vllm serve` process (on whichever host it's supposed to be
+  on). Step 3's health check returns `http_status=200` and the models list
+  matches `GPU-TRANSLATE-006`'s `qwen3.6-27b-translate`. Step 4 prints
+  `OK: '...'` with real translated text. Any of these failing pinpoints
+  exactly where the chain breaks (unset config vs. dead process vs.
+  unreachable network vs. a real client/prompt bug) -- that is a useful,
+  expected outcome of this diagnostic, not itself a failure of the action.
+  Expected artifacts: None permanent; `/tmp/translate_diag.py` is
+  temporary.
+- Rollback or cleanup: `rm /tmp/translate_diag.py`.
+- Return to Claude (secrets/hostnames redacted):
+  - Exact commands used and their output for all four steps.
+  - If step 4 errors, the full `ERROR: ...` line.
 
 ### Action ID: LATENCY-001
 
-- Status: WAITING_FOR_USER
+- Status: WAITING_FOR_USER (**on hold** -- do not run until `GPU-E2E-002`
+  resolves the translation-failure finding above; running it now would
+  measure latency against a translation backend already known to be
+  failing)
 - Purpose: Get the first-ever *real* hardware latency numbers for this
   project -- every latency measurement so far (Phase 11's local smoke
   runs of `scripts/latency_report.py`) has been against fake backends.
@@ -142,8 +159,32 @@ standing "do not proceed to another phase without direction" instruction.
   captions -- `UtteranceOrchestrator` is still not wired into the live
   gateway (see "The one gap that matters most" in
   `docs/FINAL_IMPLEMENTATION_REPORT.md`), so no transcription/translation
-  output was expected or observed here. Closes out `WINDOWS-PACKAGE-001`;
-  `GPU-E2E-001` and `LATENCY-001` remain `WAITING_FOR_USER`.
+  output was expected or observed here. Closes out `WINDOWS-PACKAGE-001`.
+
+### Action ID: GPU-E2E-001
+
+- Status: PASSED (2026-08-14), by the test's own loose assertions --
+  with a real, separately-tracked finding. See `GPU-E2E-002` (Pending
+  actions) for the follow-up diagnostic this motivated.
+- Result summary: Attempt 1 SKIPPED (`faster_whisper` not installed in a
+  freshly created venv -- Claude's own error in the originally prepared
+  command set, corrected). Attempt 2 (retry): `1 passed in 11.13s`.
+  `transcription: 'ご視聴ありがとうございました'` (a known
+  faster-whisper hallucination on non-speech/synthetic-tone input,
+  expected and not a defect). `translation_status: FAILED`,
+  `translation: None` -- the real translation leg against the real vLLM
+  server genuinely failed. The test's own assertion
+  (`translation_status is not None`) is satisfied by `FAILED`, so it
+  passed technically, but this is not evidence translation actually
+  works end-to-end on real hardware.
+- Purpose: First run of `tests/test_e2e_gpu.py` -- proves the real
+  `WhisperAsrModel` and real `VllmTranslationClient` are wired correctly
+  through a real `UtteranceOrchestrator`.
+- Run on: The ASR GPU host, `.venv-asr`.
+- Note: Full detail (both attempts) in `USER_RESULTS.md`'s `GPU-E2E-001`
+  entries. `GPU-E2E-002` is a small, read-only diagnostic to find out why
+  translation failed before `LATENCY-001` (which is on hold until this is
+  resolved) runs.
 
 ### Action ID: WINDOWS-UI-007
 
