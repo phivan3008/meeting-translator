@@ -4,187 +4,65 @@ Claude ghi các thao tác mà người dùng cần thực hiện tại đây.
 
 ## Pending actions
 
-One action to rebuild the translation GPU environment from scratch
-(`GPU-TRANSLATE-008` -- originally staged as a simple restart, expanded
-after the user confirmed `models/` and `.venv-translate` are both gone
-from that host) plus one action from Phase 11's original staging
-(`LATENCY-001`, on hold -- see below). Neither is required to close out
-Phase 11's own local scope. `WINDOWS-PACKAGE-001`, `GPU-E2E-001` and
-`GPU-E2E-002` have all PASSED -- see "Completed actions" below
-(`GPU-E2E-002`'s diagnostic is what first found that the vLLM server
-simply wasn't running, which the user then traced to the underlying
-`models/`/`.venv-translate` loss).
+One action to re-run the GPU end-to-end test (`GPU-E2E-003`) now that the
+rebuilt vLLM server reports no errors, plus one action from Phase 11's
+original staging (`LATENCY-001`, on hold -- see below). Neither is
+required to close out Phase 11's own local scope. `WINDOWS-PACKAGE-001`,
+`GPU-E2E-001`, `GPU-E2E-002` and `GPU-TRANSLATE-008` have all PASSED --
+see "Completed actions" below (`GPU-TRANSLATE-008`'s pass is on the
+user's word only, without the specific verification output requested --
+see its entry for detail; `GPU-E2E-003` will independently confirm or
+refute it).
 
-### Action ID: GPU-TRANSLATE-008
+### Action ID: GPU-E2E-003
 
-- Status: WAITING_FOR_USER (steps 1-5 completed successfully; step 6's
-  patch script failed on attempt 1 -- see below; corrected script is
-  what's shown now)
-- Attempt 1 result (2026-08-14): Steps 1-4 (recreate venv, re-download
-  weights, install vLLM, confirm no process) all reported OK. Step 5's
-  launch hit the expected flashinfer `array.array[int]` TypeError. Step
-  6's patch script itself then crashed with the *same* `TypeError`,
-  because it tried to locate the broken file by running
-  `import flashinfer.comm.fd_exchange as m` -- but importing that module
-  is exactly what evaluates the broken annotation and crashes, so the
-  import failed before the file could even be read, let alone patched.
-  Root cause: Claude's own mistake in the originally prepared script
-  (this specific patch script wasn't verified before being handed out,
-  unlike the rest of this project's commands). Corrected below by
-  locating the file via a filesystem glob under `.venv-translate/lib/`
-  instead of importing it -- the traceback itself already confirmed the
-  real path (`.venv-translate/lib/python3.11/site-packages/flashinfer/
-  comm/fd_exchange.py`), so this is not a guess.
-- Purpose: Originally staged as a simple restart, but the user has since
-  confirmed both `models/` (containing the downloaded `Qwen3.6-27B-FP8`
-  weights from `GPU-TRANSLATE-002`) and `.venv-translate` are gone from
-  the GPU host -- likely accidentally deleted. This is now a full redo of
-  `GPU-TRANSLATE-002` through `GPU-TRANSLATE-006` from scratch: recreate
-  the venv, re-download the weights, reinstall vLLM, relaunch (including
-  the known venv-scoped `flashinfer` `array.array[int]` import-time bug
-  and its patch -- see `docs/OPERATOR_RUNBOOK_SEED.md`'s "Prerequisites
-  and GPU compatibility"; a fresh `pip install vllm` will very likely hit
-  it again since the patch does not survive a reinstall), then verify.
-  ASR is unaffected -- `.venv-asr` and the `large-v3` weights are
-  confirmed still present and working (`GPU-E2E-001`/`GPU-E2E-002` both
-  ran successfully against them this session).
-- Run on: The translation GPU host (same physical host as ASR, per
-  `GPU-TRANSLATE-001`).
-- Prerequisites: Outbound network access to Hugging Face (or an internal
-  mirror). Enough free disk for the ~30.9 GB weights (confirm with
-  `df -h .` first -- `GPU-TRANSLATE-002` needed this much and more was
-  free at the time, but don't assume that's still true). Confirm the
-  project's real root path with `pwd`/`ls` before using the placeholder
-  path below -- prior sessions' docs inconsistently spelled it
-  `meetting-translator` vs `meeting-translator`, and this session's own
-  ASR-side commands resolved the single-"t" spelling, but don't assume
-  that carries over here without checking.
-- Safety notes: Downloads real model weights (~30.9 GB) and installs real
-  packages (`vllm` and its dependencies, a large install) into a new,
-  isolated venv -- does not touch `.venv-asr`, the `large-v3` weights, or
-  any other part of the host. Starts a real, resource-heavy background
-  process (~72 GB GPU memory once loaded, per `GPU-TRANSLATE-005`'s
-  precedent). This will take a while end to end (weights download was
-  ~8 minutes previously; `pip install vllm` and first model load add
-  more) -- there is no need to babysit it in real time, just check back
-  and paste the results.
+- Status: WAITING_FOR_USER
+- Purpose: `GPU-TRANSLATE-008` rebuilt the translation GPU environment
+  from scratch and the user reports it completed with no traceback/error,
+  but without pasting the specific `/health`/`/v1/models`/`nvidia-smi`
+  values requested -- so this hasn't been independently verified yet, per
+  `CLAUDE.md`'s "never assume a manual command succeeded". Re-run
+  `tests/test_e2e_gpu.py` (same test as `GPU-E2E-001`) to get a real,
+  self-contained answer: it exercises the actual translation path through
+  this project's own code and prints the real `translation_status`/
+  `translation` values, which will conclusively show whether the rebuilt
+  server works or not, independent of what wasn't pasted for
+  `GPU-TRANSLATE-008`.
+- Run on: The ASR GPU host, `.venv-asr` (already has `faster-whisper`
+  installed from `GPU-E2E-001`'s attempt 2 -- no new installs needed).
+- Prerequisites: Same venv as `GPU-E2E-001`/`GPU-E2E-002`. `VLLM_BASE_URL`
+  should already resolve to `http://localhost:8000/v1` (confirmed in
+  `GPU-E2E-002`) -- only relevant if `.venv-translate`'s vLLM server is on
+  a different host than `.venv-asr`, in which case re-check it.
+- Safety notes: Read-only against the GPU (a decode + a translation
+  request). Does not restart, stop or reconfigure anything.
 - Commands:
   ```bash
-  cd /workspace/meeting-translator   # adjust to the real path on this host -- verify with `pwd`/`ls` first
-  df -h .                             # confirm enough free disk for ~30.9 GB before downloading
-
-  # 1. Recreate the translation venv (matching GPU-TRANSLATE-002's setup).
-  python3 -m venv .venv-translate
-  source .venv-translate/bin/activate
-  python -m pip install --upgrade pip
-  pip install "huggingface_hub[cli]>=0.24"
-
-  # 2. Re-download the weights, resolving and printing the revision SHA
-  #    (matching GPU-TRANSLATE-002's precedent).
-  cat > /tmp/download_qwen.py << 'EOF'
-  from huggingface_hub import HfApi, snapshot_download
-
-  REPO_ID = "Qwen/Qwen3.6-27B-FP8"
-  TARGET_DIR = "models/Qwen3.6-27B-FP8"
-
-  api = HfApi()
-  info = api.model_info(REPO_ID)
-  print(f"repo_id={REPO_ID} revision_sha={info.sha}")
-
-  path = snapshot_download(repo_id=REPO_ID, revision=info.sha, local_dir=TARGET_DIR)
-  print(f"downloaded to {path}")
-  EOF
-  python /tmp/download_qwen.py
-  du -sh models/Qwen3.6-27B-FP8
-
-  # 3. Install vLLM (matching GPU-TRANSLATE-003's precedent -- unpinned,
-  #    same as before).
-  pip install vllm
-
-  # 4. Confirm nothing is already listening on the target port.
-  pgrep -fa "vllm serve" || echo "confirmed: no vllm serve process running"
-
-  # 5. Launch, matching GPU-TRANSLATE-004/005's proven flags exactly.
-  nohup vllm serve "$(pwd)/models/Qwen3.6-27B-FP8" \
-      --served-model-name qwen3.6-27b-translate \
-      --max-model-len 4096 \
-      --enforce-eager \
-      --port 8000 \
-      > vllm_serve.log 2>&1 &
-  disown
-  sleep 30
-  tail -n 60 vllm_serve.log
-
-  # 6. If the log shows the flashinfer TypeError (search for
-  #    "array.array' is not subscriptable" -- expected on a fresh
-  #    install, per GPU-TRANSLATE-003/004's history), patch it directly,
-  #    matching GPU-TRANSLATE-005's fix, then relaunch.
-  #    IMPORTANT: locate the file by path, NOT by importing
-  #    flashinfer.comm.fd_exchange -- importing it is exactly what
-  #    triggers the crash (the broken annotation is evaluated at import
-  #    time), so an import-based locator fails with the same TypeError
-  #    instead of patching anything (this happened on the first attempt
-  #    -- Claude's own mistake in the originally prepared script).
-  grep -q "is not subscriptable" vllm_serve.log && python3 - << 'EOF'
-  import re
-  from pathlib import Path
-  candidates = list(Path(".venv-translate/lib").glob("python3.*/site-packages/flashinfer/comm/fd_exchange.py"))
-  if not candidates:
-      print("fd_exchange.py not found under .venv-translate/lib -- report back, don't guess further")
-  else:
-      path = candidates[0]
-      text = path.read_text()
-      pattern = r'(?<!["\'])array\.array\[int\](?!["\'])'
-      if re.search(pattern, text):
-          path.write_text(re.sub(pattern, '"array.array[int]"', text))
-          print(f"patched OK: {path}")
-      else:
-          print(f"pattern not found in {path} -- may already be patched or differ from expected, report back")
-  EOF
-  # If "patched OK" printed, relaunch (repeat step 5's nohup command,
-  # then re-check the log the same way).
-
-  # 7. Once the log shows a clean startup ("Application startup complete."
-  #    / "API server: HTTP server started", matching GPU-TRANSLATE-005),
-  #    verify over HTTP exactly as GPU-TRANSLATE-006 did.
-  curl -s -o /dev/null -w "http_status=%{http_code}\n" http://localhost:8000/health
-  curl -s http://localhost:8000/v1/models
-  nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+  cd /workspace/meeting-translator   # adjust to the real path on this host
+  source .venv-asr/bin/activate
+  pytest -m gpu tests/test_e2e_gpu.py -v -s
   ```
-- Expected success indicators: Step 2 prints a resolved `revision_sha` and
-  `du -sh` shows ~29-31G on disk (matching `GPU-TRANSLATE-002`'s result).
-  Step 5's log reaches "Application startup complete." with no traceback
-  (if the flashinfer bug appears instead, that's expected on a fresh
-  install -- proceed to step 6, not a dead end). Step 7's `/health`
-  returns `http_status=200`, `/v1/models` lists `qwen3.6-27b-translate`
-  with `max_model_len:4096` (matching `GPU-TRANSLATE-006` exactly), and
-  `nvidia-smi` shows substantial GPU memory in use (~72 GB total is
-  consistent with weights + KV cache, matching `GPU-TRANSLATE-005`) with
-  no OOM.
-  Expected artifacts: `models/Qwen3.6-27B-FP8/` (~30.9 GB), `.venv-translate/`,
-  `vllm_serve.log` in the project root (same as `GPU-TRANSLATE-002`-`005`'s
-  precedent -- keep it local, paste the relevant excerpt back rather than
-  the whole file if it's large).
-- Rollback or cleanup: If something goes wrong and needs to be stopped:
-  `pkill -f "vllm serve"`. `/tmp/download_qwen.py` can be removed after
-  use (`rm /tmp/download_qwen.py`). No other cleanup needed.
-- Return to Claude (secrets/hostnames redacted):
-  - The resolved `revision_sha` and `du -sh` output from step 2.
-  - Whether `pip install vllm` completed cleanly (and the version it
-    installed, e.g. from `pip show vllm`).
-  - Whether the flashinfer patch (step 6) was needed.
-  - The final `vllm_serve.log` excerpt showing startup success (or
-    failure, if it didn't start).
-  - The `/health` status code, the `/v1/models` response, and the
-    `nvidia-smi` memory line.
+- Expected success indicators: The test passes (as it did in `GPU-E2E-001`
+  either way, since its assertion is loose), but this time look at the
+  printed `translation_status` and `translation` lines specifically --
+  `translation_status: <TranslationStatus.COMPLETED: 'completed'>` with a
+  non-`None`, real-looking `translation` string means the rebuild actually
+  fixed it. `FAILED` again means something is still wrong and needs
+  further diagnosis (a repeat of `GPU-E2E-002`-style investigation, not
+  assumed to be the same cause).
+  Expected artifacts: None persisted; test output only.
+- Rollback or cleanup: None needed.
+- Return to Claude:
+  - Full pytest output, especially the `transcription`/`translation_status`/
+    `translation` lines.
+  - Pass/fail/skip status.
 
 ### Action ID: LATENCY-001
 
-- Status: WAITING_FOR_USER (**on hold** -- do not run until
-  `GPU-TRANSLATE-008` gets the vLLM server running again and `GPU-E2E-001`
-  is re-run to confirm translation actually works end-to-end; running it
-  now would measure latency against a translation backend already known
-  to be down)
+- Status: WAITING_FOR_USER (**on hold** -- do not run until `GPU-E2E-003`
+  confirms `translation_status: COMPLETED` with real translated text;
+  running it now would measure latency against a translation backend not
+  yet confirmed working)
 - Purpose: Get the first-ever *real* hardware latency numbers for this
   project -- every latency measurement so far (Phase 11's local smoke
   runs of `scripts/latency_report.py`) has been against fake backends.
@@ -288,6 +166,37 @@ simply wasn't running, which the user then traced to the underlying
 - Note: Root cause is simply that the vLLM server from `GPU-TRANSLATE-005`
   is not currently running on this host -- no code defect anywhere in
   this project. `GPU-TRANSLATE-008` (Pending actions) restarts it.
+
+### Action ID: GPU-TRANSLATE-008
+
+- Status: PASSED (2026-08-14) -- on the user's word only, NOT
+  independently verified against specific output. See `GPU-E2E-003`
+  (Pending actions) for the follow-up that will conclusively confirm or
+  refute this.
+- Result summary: Attempt 1: steps 1-4 (recreate `.venv-translate`,
+  re-download `Qwen3.6-27B-FP8`, install vLLM, confirm no process) all
+  reported OK; step 5's launch hit the expected flashinfer
+  `array.array[int]` TypeError; step 6's patch script then crashed with
+  the same error, because it located the broken file by importing it --
+  which is exactly what triggers the bug. Root cause: Claude's own
+  mistake in the originally prepared script, not verified before being
+  handed out. Attempt 2 (retry, corrected patch script using a filesystem
+  glob instead of an import): user reported "All command is OK. Don't
+  have any traceback, error or exception," without pasting the
+  `/health` status code, `/v1/models` response, `nvidia-smi` memory line,
+  or `vllm_serve.log` excerpt that were requested.
+- Purpose: Full rebuild of the translation GPU environment after the user
+  found `models/` and `.venv-translate` both missing on the host (likely
+  accidental deletion) -- redo of `GPU-TRANSLATE-002` through
+  `GPU-TRANSLATE-006` from scratch.
+- Run on: The translation GPU host, new `.venv-translate`.
+- Note: Recorded as PASSED on the user's confirmation per this project's
+  practice of accepting terse "no traceback/error" confirmations (see
+  `WINDOWS-UI-007`'s precedent), but per `CLAUDE.md`'s "never assume a
+  manual command succeeded," this specific result carries a caveat since
+  none of the requested return values were provided. `GPU-E2E-003`
+  provides independent, self-contained proof either way by exercising the
+  real translation path and printing the actual result.
 
 ### Action ID: WINDOWS-UI-007
 

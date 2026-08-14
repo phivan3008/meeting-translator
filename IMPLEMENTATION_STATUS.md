@@ -1897,16 +1897,25 @@ section covers what was built and how it was verified.
     found the root cause: not a config bug (`vllm_base_url` resolved
     correctly), not a client bug (`VllmTranslationClient` correctly
     classified the connection failure), simply that the vLLM server from
-    `GPU-TRANSLATE-005` is not currently running on this host at all (no
-    process, connection refused on port 8000). `GPU-TRANSLATE-008` is
-    staged and `WAITING_FOR_USER` in `MANUAL_ACTIONS.md` to restart it,
-    reusing `GPU-TRANSLATE-004`/`005`'s proven launch procedure (including
-    the venv-scoped `flashinfer` patch, which may or may not still be
-    needed depending on whether this is the same venv/host). `GPU-E2E-001`
-    should be re-run afterward to confirm translation actually works
-    end-to-end on real hardware before `LATENCY-001` (still on hold) --
-    measuring latency against a translation backend already known to be
-    down would produce misleading numbers.
+    `GPU-TRANSLATE-005` was not running on this host. The user then found
+    the deeper cause: `models/` (the downloaded `Qwen3.6-27B-FP8` weights)
+    and `.venv-translate` had both been accidentally deleted from the GPU
+    host. `GPU-TRANSLATE-008` redid the full setup from scratch (venv,
+    weights re-download, vLLM reinstall, the venv-scoped `flashinfer`
+    patch -- needed again on this fresh install, and Claude's first patch
+    script attempt had its own bug, self-defeatingly trying to *import*
+    the broken module to locate it; corrected on retry) and PASSED
+    (2026-08-14), though only on the user's word -- the specific
+    `/health`/`/v1/models`/`nvidia-smi` output requested was not pasted,
+    so per `CLAUDE.md`'s "never assume a manual command succeeded" this
+    isn't independently confirmed yet. `GPU-E2E-003` (re-running
+    `tests/test_e2e_gpu.py`) is staged and `WAITING_FOR_USER` in
+    `MANUAL_ACTIONS.md` to get that independent confirmation -- it prints
+    the real `translation_status`/`translation` values from the actual
+    translation path. `LATENCY-001` stays on hold until `GPU-E2E-003`
+    confirms `translation_status: COMPLETED` with real text -- measuring
+    latency against a translation backend not yet confirmed working would
+    produce misleading numbers.
   - UI acceptance criteria about partial/final/translation *rendering*
     (gray hint, bold final, normal-weight translation, retry/failure
     visibility) remain LOCAL_VERIFIED only, not screen-verified with real
@@ -1969,19 +1978,28 @@ translation leg FAILED against the real vLLM server
 translate correctly on 2026-08-12. The follow-up diagnostic,
 `GPU-E2E-002`, PASSED (2026-08-14) and conclusively found why: not a
 config bug, not a client bug -- the vLLM server from `GPU-TRANSLATE-005`
-is simply not running on this host right now (no process, connection
-refused on port 8000). `GPU-TRANSLATE-008`, which restarts it using
-`GPU-TRANSLATE-004`/`005`'s already-proven launch procedure, is now
-staged and `WAITING_FOR_USER` in `MANUAL_ACTIONS.md`. `GPU-E2E-001`
-should be re-run afterward to confirm translation actually works
-end-to-end before `LATENCY-001` (still deliberately on hold) runs --
-measuring latency against a translation backend already known to be down
-would produce misleading numbers. The user instructed Claude not to
-connect to or operate the GPU server itself and to prepare only the next
-manual command set each time; `GPU-TRANSLATE-008` is that next command
-set. None of these remaining actions' results are required to close out
-Phase 11's own local scope. Do not begin any further work (these staged
-actions beyond preparing the next
+was simply not running on this host. The user then found the deeper
+cause: `models/` (the `Qwen3.6-27B-FP8` weights) and `.venv-translate`
+had both been accidentally deleted from the GPU host. `GPU-TRANSLATE-008`
+redid the full setup from scratch, including hitting and fixing a bug in
+Claude's own first flashinfer-patch script (it tried to *import* the
+broken module to locate it, which is exactly what triggers the crash it
+was patching -- corrected on retry to locate the file by filesystem glob
+instead), and PASSED (2026-08-14) -- though only on the user's word, not
+against the specific `/health`/`/v1/models`/`nvidia-smi` output requested,
+so this isn't independently confirmed. `GPU-E2E-003` (re-running
+`tests/test_e2e_gpu.py`, staged and `WAITING_FOR_USER` in
+`MANUAL_ACTIONS.md`) will get that independent confirmation by printing
+the real `translation_status`/`translation` values. `LATENCY-001` (still
+deliberately on hold) waits for `GPU-E2E-003` to confirm
+`translation_status: COMPLETED` with real text -- measuring latency
+against a translation backend not yet confirmed working would produce
+misleading numbers. The user instructed Claude not to connect to or
+operate the GPU server itself and to prepare only the next manual command
+set each time; `GPU-E2E-003` is that next command set. None of these
+remaining actions' results are required to close out Phase 11's own local
+scope. Do not begin any further work (these staged actions beyond
+preparing the next
 command set, the gateway-wiring gap, or anything else) without the user's
 explicit direction. Take a local snapshot first
 (`python scripts/local_backup.py --label <name>`) -- as the very first

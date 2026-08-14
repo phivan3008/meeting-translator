@@ -927,6 +927,31 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   `Qwen3.6-27B-FP8` re-download and `vllm` install themselves are not
   known to be a problem -- only the patch step needs retrying.
 
+### GPU-TRANSLATE-008 (attempt 2, retry)
+
+- Date: 2026-08-14
+- Environment: GPU server, `.venv-translate`.
+- Command summary: corrected flashinfer patch script (filesystem-glob
+  locator), relaunch, then the `/health`/`/v1/models`/`nvidia-smi`
+  verification commands.
+- Exit status: reported by the user as "All command is OK. Don't have any
+  traceback, error or exception," without pasting the specific requested
+  return values.
+- Result: PASSED, on the user's word -- but NOT independently verified
+  against specific output (no `/health` status code, `/v1/models`
+  response, `nvidia-smi` memory line, or `vllm_serve.log` excerpt was
+  provided). Recorded honestly as such per `CLAUDE.md`'s "never assume a
+  manual command succeeded" -- this is a terse user confirmation, not
+  verified detail.
+- Relevant output summary: none pasted.
+- Redacted raw output file, if any: none.
+- Follow-up: `GPU-E2E-001` is being re-run next specifically because it
+  gives a stronger, self-contained proof regardless of this gap -- it
+  exercises the real translation path end-to-end through the project's
+  own code and prints the actual `translation_status`/`translation`
+  values, which will conclusively show whether the rebuilt vLLM server
+  actually works, independent of whatever wasn't pasted here.
+
 ## Result template
 
 ```markdown
