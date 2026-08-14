@@ -748,6 +748,73 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
 - Follow-up: Windows audio marked HARDWARE_VERIFIED. Independent mic/loopback
   capture confirmed on real (virtualized) Windows devices.
 
+### WINDOWS-PACKAGE-001
+
+- Date: 2026-08-14
+- Environment: Windows, PowerShell, project root, fresh `.venv`
+  (`pip install -e ".[client,windows-audio,packaging,server]"`); a WAV
+  file with Vietnamese speech playing through the default output device
+  while the app was connected.
+- Command summary:
+  - `python -m venv .venv`
+  - `.venv\Scripts\activate`
+  - `pip install -e ".[client,windows-audio,packaging,server]"`
+  - `python scripts\build_windows_client.py --clean`
+  - `.\dist\MeetingTranslator-0.1.0\MeetingTranslator-0.1.0.exe`
+  - `uvicorn server.app:app --host 0.0.0.0 --port 8080 --reload` (second
+    terminal, local dev server to connect against)
+- Exit status: no traceback/error/exception reported for any step.
+- Result: PASSED
+- Relevant output summary:
+  - Build completed with no error.
+  - The `.exe` launched a window titled "Meeting Translator v0.1.0".
+  - Device dropdowns populated with real input/loopback devices.
+  - Connect/Disconnect worked against the local dev server with no
+    traceback or freeze.
+  - Expected artifacts present: `dist/MeetingTranslator-0.1.0/`; no other
+    artifacts reported.
+- Redacted raw output file, if any: none.
+- Follow-up: First hardware confirmation that a packaged (PyInstaller)
+  build of the Windows client -- not just `python -m client.ui.bootstrap`
+  -- launches and behaves correctly, matching the same Connect/Disconnect
+  behavior already hardware-verified for the unpackaged app in
+  `WINDOWS-UI-005`-`WINDOWS-UI-007`. This is a UI/connectivity check only;
+  no live captions were expected or observed, since `UtteranceOrchestrator`
+  is still not wired into the live gateway. `WINDOWS-PACKAGE-001` is
+  PASSED and closed. `GPU-E2E-001` and `LATENCY-001` remain
+  `WAITING_FOR_USER`.
+
+### GPU-E2E-001 (attempt 1)
+
+- Date: 2026-08-14
+- Environment: GPU server, fresh `.venv-asr` created via `python -m venv
+  .venv-asr` at `/workspace/meeting-translator`.
+- Command summary:
+  - `python -m venv .venv-asr`
+  - `source .venv-asr/bin/activate`
+  - `pip install -e ".[dev]"`
+  - `pytest -m gpu tests/test_e2e_gpu.py -v -s`
+- Exit status: pytest ran cleanly, 0 failures.
+- Result: SKIPPED (not a pass) -- environment gap, not a code defect.
+- Relevant output summary: `tests/test_e2e_gpu.py s` / `1 skipped in
+  0.36s`. No transcription/translation output printed, since the test's
+  own `requires_gpu_stack` skip-marker fired before the body ran.
+- Redacted raw output file, if any: none.
+- Follow-up: Root cause is a mistake in the command set Claude originally
+  prepared for `GPU-E2E-001`, not anything the user did wrong.
+  `faster-whisper` (which `tests/test_e2e_gpu.py` gates on via
+  `importlib.util.find_spec("faster_whisper")`) lives behind
+  `pyproject.toml`'s separate `gpu` extra
+  (`faster-whisper>=1.0,<2`/`silero-vad>=5,<6`/`vllm`), not `dev` -- so
+  `pip install -e ".[dev]"` alone never installs it, and a freshly created
+  venv has no prior install to fall back on. Corrected command set
+  installs `faster-whisper` directly (matching the precedent already
+  established in `GPU-ASR-002`, rather than the full `gpu` extra, since
+  installing `vllm` again on the ASR host is unnecessary weight -- this
+  test's `VllmTranslationClient` only needs `httpx`, already in `dev`, to
+  reach the already-running vLLM server over HTTP). See
+  `MANUAL_ACTIONS.md`'s updated `GPU-E2E-001` for the retry commands.
+
 ## Result template
 
 ```markdown

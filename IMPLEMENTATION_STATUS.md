@@ -1312,10 +1312,16 @@ section covers what was built and how it was verified.
   the temporarily-installed packages were uninstalled to restore the
   documented baseline environment (see "Commands last run locally"). **A
   successful build is not the same as a hardware-verified working
-  application**: the produced `.exe` was never launched, and real audio
-  capture/UI rendering/network behavior on it is untested -- staged as
-  `WINDOWS-PACKAGE-001` in `MANUAL_ACTIONS.md`, consistent with
-  `CLAUDE.md`'s "never claim hardware verification from mocks."
+  application on its own** -- consistent with `CLAUDE.md`'s "never claim
+  hardware verification from mocks," this was staged as
+  `WINDOWS-PACKAGE-001` in `MANUAL_ACTIONS.md` rather than assumed. **The
+  user has since run that action and it PASSED (2026-08-14)**: a fresh
+  venv, a real PyInstaller build, and the packaged `.exe` launched with a
+  real window title, real device dropdowns, and clean Connect/Disconnect
+  against a local dev server (Vietnamese-speech WAV playing for the
+  loopback path), no traceback or exception. See `USER_RESULTS.md`'s
+  `WINDOWS-PACKAGE-001` entry. This is a UI/connectivity check only, not
+  evidence of live captions (see "the one gap that matters most" below).
 - **Version metadata and upgrade strategy**: `shared/version.py`
   (`__version__ = "0.1.0"`, bumped from the placeholder `0.0.0`), synced
   with `pyproject.toml`'s `[project] version` and enforced by
@@ -1873,17 +1879,18 @@ section covers what was built and how it was verified.
   - The `translation_queue_depth` Gauge cross-session-sharing limitation
     (found by this phase's own load test) is newly documented, not fixed
     -- see "Phase 11 deliverables"'s last bullet.
-  - Three genuinely hardware-dependent verifications are staged and
-    `WAITING_FOR_USER` in `MANUAL_ACTIONS.md`: `WINDOWS-PACKAGE-001`
-    (launch the already-built packaged `.exe` on real Windows hardware
-    with real audio and a real/dev server connection),
-    `GPU-E2E-001` (run `tests/test_e2e_gpu.py` on the GPU host against the
-    already-confirmed-working `large-v3`/vLLM setup), and `LATENCY-001`
-    (run `scripts/latency_report.py --real-backends` on/near the GPU host
-    for genuine p50/p95/p99 numbers to compare against
-    `docs/PRODUCT_REQUIREMENTS.md` section 5's objectives -- this
-    project has never yet measured those objectives against real
-    hardware, only characterized the measurement tool itself locally).
+  - Of the three genuinely hardware-dependent verifications staged in
+    `MANUAL_ACTIONS.md`, `WINDOWS-PACKAGE-001` (launch the packaged `.exe`
+    on real Windows hardware with real audio and a real/dev server
+    connection) has now PASSED (2026-08-14; see `USER_RESULTS.md`). Two
+    remain `WAITING_FOR_USER`: `GPU-E2E-001` (run `tests/test_e2e_gpu.py`
+    on the GPU host against the already-confirmed-working `large-v3`/vLLM
+    setup) and `LATENCY-001` (run `scripts/latency_report.py
+    --real-backends` on/near the GPU host for genuine p50/p95/p99 numbers
+    to compare against `docs/PRODUCT_REQUIREMENTS.md` section 5's
+    objectives -- this project has never yet measured those objectives
+    against real hardware, only characterized the measurement tool itself
+    locally).
   - UI acceptance criteria about partial/final/translation *rendering*
     (gray hint, bold final, normal-weight translation, retry/failure
     visibility) remain LOCAL_VERIFIED only, not screen-verified with real
@@ -1924,19 +1931,30 @@ consistent with the standing "do not proceed to another phase without
 direction" instruction, which applies here as much as ever precisely
 *because* this was the last titled phase.
 
-Three genuinely hardware-dependent manual actions are staged and
-`WAITING_FOR_USER` in `MANUAL_ACTIONS.md`: `WINDOWS-PACKAGE-001` (run the
-already-built packaged Windows client on real hardware),
-`GPU-E2E-001` (run the new `tests/test_e2e_gpu.py` on the GPU host), and
-`LATENCY-001` (run `scripts/latency_report.py --real-backends` for the
-first-ever real hardware latency numbers against
-`docs/PRODUCT_REQUIREMENTS.md`'s objectives). None of their results are
-required to close out Phase 11's own local scope, so Claude is stopping
-here rather than assuming the user wants them run immediately -- per the
-original instruction for this turn ("Do not proceed to another phase").
-Do not begin any further work (the three staged actions, the
-gateway-wiring gap, or anything else) without the user's explicit
-direction. Take a local snapshot first
+Of the three staged hardware-dependent manual actions, `WINDOWS-PACKAGE-001`
+(run the already-built packaged Windows client on real hardware) has
+PASSED (2026-08-14): the user built a fresh venv, ran a real PyInstaller
+build, and confirmed the `.exe` launches, shows real device dropdowns, and
+Connect/Disconnect works cleanly against a local dev server with a
+Vietnamese-speech WAV playing for the loopback path -- no traceback or
+exception. See `MANUAL_ACTIONS.md`'s completed-actions entry and
+`USER_RESULTS.md` for the full result. This is a UI/connectivity check
+only, not evidence of live captions.
+
+Two remain `WAITING_FOR_USER` in `MANUAL_ACTIONS.md`: `GPU-E2E-001` (run
+the new `tests/test_e2e_gpu.py` on the GPU host) and `LATENCY-001` (run
+`scripts/latency_report.py --real-backends` for the first-ever real
+hardware latency numbers against `docs/PRODUCT_REQUIREMENTS.md`'s
+objectives). The user instructed Claude not to connect to or operate the
+GPU server itself and to prepare only the next manual command set;
+`GPU-E2E-001` is presented next (it was staged first and logically
+precedes `LATENCY-001`, since a working correctness check on the GPU path
+is a more useful thing to confirm before spending a run on latency
+numbers). Neither result is required to close out Phase 11's own local
+scope. Do not begin any further work (these two staged actions beyond
+preparing the next
+command set, the gateway-wiring gap, or anything else) without the user's
+explicit direction. Take a local snapshot first
 (`python scripts/local_backup.py --label <name>`) -- as the very first
 action, before any reading/research -- before starting whichever the user
 chooses next.

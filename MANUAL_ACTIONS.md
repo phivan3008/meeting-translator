@@ -4,100 +4,72 @@ Claude ghi các thao tác mà người dùng cần thực hiện tại đây.
 
 ## Pending actions
 
-Three actions staged by Phase 11 (end-to-end tests and Windows packaging),
-none required to close out that phase's own local scope -- Claude is
+Two actions staged by Phase 11 (end-to-end tests and Windows packaging),
+neither required to close out that phase's own local scope -- Claude is
 waiting for the user's direction on whether/when to run them, per the
 standing "do not proceed to another phase without direction" instruction.
-
-### Action ID: WINDOWS-PACKAGE-001
-
-- Status: WAITING_FOR_USER
-- Purpose: Verify the packaged Windows client actually launches and works
-  with real audio hardware and a real (or local dev) server connection.
-  This session already confirmed the *build itself* succeeds (see
-  `IMPLEMENTATION_STATUS.md`'s "Phase 11 deliverables" -- a real ~120 MB
-  PyInstaller build completed with no import errors, then was deleted
-  again) but per `CLAUDE.md` that is not hardware verification of the
-  running application.
-- Run on: Windows PC with real microphone/loopback audio hardware (the
-  same machine `WINDOWS-UI-001`-`WINDOWS-UI-007` were run on is a
-  reasonable choice, since it already has a working Python/PySide6/
-  PyAudioWPatch setup).
-- Prerequisites: Python 3.11+, this project's source present locally.
-  `pip install -e ".[client,windows-audio,packaging]"` in a fresh or
-  existing venv on that machine.
-- Safety notes: This only builds and runs a local executable; it opens a
-  real WebSocket connection if pointed at a real server, so use a
-  server/token you control, not a production one, for this check. No
-  system-level changes beyond the Python venv.
-- Commands (PowerShell, from the project root):
-  ```powershell
-  pip install -e ".[client,windows-audio,packaging]"
-  python scripts\build_windows_client.py --clean
-  .\dist\MeetingTranslator-0.1.0\MeetingTranslator-0.1.0.exe
-  ```
-  With a local dev server running separately (`uvicorn server.app:app`)
-  to connect against, per `README.md`'s CPU-mocked quick start -- note
-  this will not produce live captions yet (`UtteranceOrchestrator` is not
-  wired into the gateway -- see "Known limitations"), so the useful check
-  here is the window opening, device selectors populating, connect/
-  disconnect working, and no crash/traceback, not seeing real
-  transcription output.
-- Expected success indicators: The build completes with no error; the
-  `.exe` launches a window titled "Meeting Translator v0.1.0"; device
-  dropdowns populate with real input/loopback devices; Connect/Disconnect
-  works against a local dev server with no traceback or freeze (the exact
-  regressions `WINDOWS-UI-005`/`WINDOWS-UI-006` already fixed and
-  hardware-confirmed -- this is really a "still true in a packaged build,
-  not just `python -m client.ui.bootstrap`" check).
-  Expected artifacts: `dist/MeetingTranslator-0.1.0/` (the build); no
-  other artifacts expected.
-- Rollback or cleanup: Delete `build/`/`dist/` when done (already excluded
-  from local snapshots).
-- Return to Claude:
-  - Exact commands used and their exit status.
-  - Whether the build succeeded and the `.exe` actually launched.
-  - Whether Connect/Disconnect worked cleanly (any traceback, freeze or
-    crash observed).
-  - Whether device dropdowns showed real devices.
-  - Any error output (secrets/tokens redacted).
+`WINDOWS-PACKAGE-001` (the third staged action) has PASSED -- see
+"Completed actions" below.
 
 ### Action ID: GPU-E2E-001
 
-- Status: WAITING_FOR_USER
+- Status: WAITING_FOR_USER (attempt 1 SKIPPED -- see below; this is the
+  corrected retry)
 - Purpose: Run the new optional GPU end-to-end test
   (`tests/test_e2e_gpu.py`) for the first time -- proves the real
   `WhisperAsrModel` and real `VllmTranslationClient` work correctly when
   driven together through a real `UtteranceOrchestrator`, not just each in
   isolation (which `GPU-ASR-004`/`GPU-ASR-005` and
   `GPU-TRANSLATE-006`/`GPU-TRANSLATE-007` already separately confirmed).
+- Attempt 1 result (2026-08-14): SKIPPED (`1 skipped in 0.36s`), not a
+  pass. Root cause: Claude's own error, not the user's -- the previously
+  prepared command set only ran `pip install -e ".[dev]"` in a freshly
+  created `.venv-asr`, but `faster-whisper` lives behind `pyproject.toml`'s
+  separate `gpu` extra, not `dev`, so it was never installed and the
+  test's own `faster_whisper`-availability skip-marker correctly fired.
+  Full detail in `USER_RESULTS.md`'s `GPU-E2E-001 (attempt 1)` entry.
+  Fixed below by installing `faster-whisper` directly. Also noted: the
+  pytest output's own `rootdir` printed as `/workspace/meeting-translator`
+  (single "t"), not the `/workspace/meetting-translator` (double "t")
+  path this and prior GPU actions' prepared commands used as a
+  placeholder -- adjust the `cd` below to whatever this host's actual
+  path is; do not assume either spelling.
 - Run on: The ASR GPU host (needs `faster-whisper`/`ctranslate2` and the
   already-downloaded `large-v3` weights, per `GPU-ASR-004`), with network
   reachability to the already-running vLLM server from `GPU-TRANSLATE-005`
   (same host or different -- `VllmTranslationClient` only needs `httpx`,
   not the `vllm` package itself, to make requests).
-- Prerequisites: This project's source present on that host (matches the
-  existing `/workspace/meetting-translator/` layout referenced by prior
-  `GPU-ASR-*`/`GPU-TRANSLATE-*` actions). `pip install -e ".[dev]"` in the
-  existing `.venv-asr` (already has `faster-whisper`) so `pytest` and this
-  project's own packages are available; `VLLM_BASE_URL` in that
-  environment's `.env` (or exported) pointing at the running vLLM server.
+- Prerequisites: This project's source present on that host. `pip install
+  -e ".[dev]"` plus `pip install "faster-whisper>=1.0,<2"` in the venv (the
+  `.venv-asr` created in attempt 1 already has `dev` installed, so only
+  the second command is strictly needed there) so `pytest` and this
+  project's own packages are available; `VLLM_BASE_URL` set (in that
+  environment's `.env` or exported) pointing at the running vLLM server
+  from `GPU-TRANSLATE-005` -- confirm that server is still actually
+  running (e.g. `curl -s -o /dev/null -w "%{http_code}" $VLLM_BASE_URL/health`
+  or the equivalent `/health` check from `GPU-TRANSLATE-006`) before
+  running the test, since it may have been stopped since that session.
 - Safety notes: Read-only against the GPU (a decode + a translation
   request, nothing destructive); does not restart, stop or reconfigure
   anything. No secrets are echoed by the test itself.
 - Commands:
   ```bash
-  cd /workspace/meetting-translator   # adjust to the real path on this host
+  cd /workspace/meeting-translator   # adjust to the real path on this host
   source .venv-asr/bin/activate       # or the equivalent venv
   pip install -e ".[dev]"
+  pip install "faster-whisper>=1.0,<2"
+  python -c "import faster_whisper; print('faster_whisper', faster_whisper.__version__)"
   pytest -m gpu tests/test_e2e_gpu.py -v -s
   ```
-- Expected success indicators: The test passes; printed output shows a
-  real `asr_final_ms >= 0` and (if the synthetic tone produced any
-  non-empty transcription) a `translation_status` other than `None`. A
-  skip (not a pass) means `faster_whisper` wasn't importable in that
-  environment -- check the venv. A failure with an `AsrOutOfMemoryError`
-  or a translation `OVERLOADED` error is itself useful signal (see
+- Expected success indicators: The `python -c` import check prints a
+  version with no error. The test passes; printed output shows a real
+  `asr_final_ms >= 0` and (if the synthetic tone produced any non-empty
+  transcription) a `translation_status` other than `None`. A skip (not a
+  pass) still means `faster_whisper` wasn't importable in that
+  environment -- if it recurs after the explicit install above, paste the
+  full `pip install "faster-whisper>=1.0,<2"` output, since that would be
+  a new, different problem. A failure with an `AsrOutOfMemoryError` or a
+  translation `OVERLOADED` error is itself useful signal (see
   `docs/OPERATOR_RUNBOOK_SEED.md`'s "Whisper or vLLM OOM response"), not
   necessarily a bug in the test.
   Expected artifacts: None persisted; test output only.
@@ -150,6 +122,28 @@ standing "do not proceed to another phase without direction" instruction.
     `GPU_MANUAL_WORKFLOW.md`).
 
 ## Completed actions
+
+### Action ID: WINDOWS-PACKAGE-001
+
+- Status: PASSED (2026-08-14)
+- Result summary: Build completed with no error. The `.exe` launched a
+  window titled "Meeting Translator v0.1.0". Device dropdowns populated
+  with real input/loopback devices. Connect/Disconnect worked against a
+  local dev server with no traceback or freeze, with a Vietnamese-speech
+  WAV actively playing for the loopback path. No exception observed.
+- Purpose: Verify the packaged Windows client (built via
+  `scripts/build_windows_client.py`, real PyInstaller build) actually
+  launches and works with real audio hardware and a real local dev server
+  connection -- a successful build alone (already confirmed earlier this
+  session, see `IMPLEMENTATION_STATUS.md`'s "Phase 11 deliverables") is
+  not the same as a hardware-verified running application.
+- Run on: Windows PC, real microphone/loopback audio hardware.
+- Note: This is a UI/connectivity smoke check only, not evidence of live
+  captions -- `UtteranceOrchestrator` is still not wired into the live
+  gateway (see "The one gap that matters most" in
+  `docs/FINAL_IMPLEMENTATION_REPORT.md`), so no transcription/translation
+  output was expected or observed here. Closes out `WINDOWS-PACKAGE-001`;
+  `GPU-E2E-001` and `LATENCY-001` remain `WAITING_FOR_USER`.
 
 ### Action ID: WINDOWS-UI-007
 
