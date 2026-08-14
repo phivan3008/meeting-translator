@@ -856,6 +856,42 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   misleading numbers. `GPU-E2E-002` (see `MANUAL_ACTIONS.md`) is a small,
   read-only diagnostic to narrow this down before proceeding.
 
+### GPU-E2E-002
+
+- Date: 2026-08-14
+- Environment: GPU server, `.venv-asr` (same as `GPU-E2E-001`).
+- Command summary:
+  - `python -c "from shared.settings import Settings; print(Settings().vllm_base_url)"`
+  - `pgrep -fa "vllm serve"`
+  - `curl .../health`, `curl .../v1/models`
+  - `/tmp/translate_diag.py` (one real `VllmTranslationClient.complete_chat` call)
+- Exit status: no exception in commands 1-3; command 4's translation
+  attempt raised (caught and printed by the script itself, not an
+  uncaught crash).
+- Result: PASSED as a diagnostic (root cause found, unambiguous).
+- Relevant output summary:
+  - Step 1: `resolved vllm_base_url=http://localhost:8000/v1` -- config
+    resolution is correct, not the problem.
+  - Step 2: `no vllm serve process found on this host`.
+  - Step 3: `http_status=000` / `unreachable` -- no server listening on
+    that port at all (not a 4xx/5xx, not a timeout on a live process --
+    connection itself fails).
+  - Step 4: `vllm_base_url='http://localhost:8000/v1'
+    model='qwen3.6-27b-translate'` (config correct) then
+    `ERROR: TranslationOverloadedError: All connection attempts failed`
+    (`VllmTranslationClient` correctly classified the raw `httpx`
+    connection failure as `TranslationOverloadedError` via
+    `classify_backend_error`'s "connect"-in-exception-name heuristic --
+    working as designed, not a client bug).
+- Redacted raw output file, if any: none.
+- Follow-up: Root cause is unambiguous and not a code defect anywhere in
+  this project -- the vLLM server from `GPU-TRANSLATE-005` is simply not
+  running on this host right now (no process, no listener on port 8000).
+  `GPU-E2E-001`'s `TranslationStatus.FAILED` result is now fully
+  explained. `GPU-TRANSLATE-008` (see `MANUAL_ACTIONS.md`) restarts the
+  server so `GPU-E2E-001` and `LATENCY-001` can be meaningfully re-run
+  afterward.
+
 ## Result template
 
 ```markdown

@@ -1893,12 +1893,20 @@ section covers what was built and how it was verified.
     NOT yet confirmed working, despite `GPU-TRANSLATE-007` separately
     confirming the vLLM server itself could translate correctly back on
     2026-08-12. See `USER_RESULTS.md`'s `GPU-E2E-001` entries for detail.
-    A new diagnostic, `GPU-E2E-002`, is staged and `WAITING_FOR_USER` in
-    `MANUAL_ACTIONS.md` to narrow down why (dead/unreachable vLLM process,
-    misconfigured `VLLM_BASE_URL` on this host/venv, or a real client
-    bug). `LATENCY-001` is deliberately on hold until `GPU-E2E-002`
-    resolves this -- measuring latency against a translation backend
-    already known to be failing would produce misleading numbers.
+    A diagnostic, `GPU-E2E-002`, PASSED (2026-08-14) and conclusively
+    found the root cause: not a config bug (`vllm_base_url` resolved
+    correctly), not a client bug (`VllmTranslationClient` correctly
+    classified the connection failure), simply that the vLLM server from
+    `GPU-TRANSLATE-005` is not currently running on this host at all (no
+    process, connection refused on port 8000). `GPU-TRANSLATE-008` is
+    staged and `WAITING_FOR_USER` in `MANUAL_ACTIONS.md` to restart it,
+    reusing `GPU-TRANSLATE-004`/`005`'s proven launch procedure (including
+    the venv-scoped `flashinfer` patch, which may or may not still be
+    needed depending on whether this is the same venv/host). `GPU-E2E-001`
+    should be re-run afterward to confirm translation actually works
+    end-to-end on real hardware before `LATENCY-001` (still on hold) --
+    measuring latency against a translation backend already known to be
+    down would produce misleading numbers.
   - UI acceptance criteria about partial/final/translation *rendering*
     (gray hint, bold final, normal-weight translation, retry/failure
     visibility) remain LOCAL_VERIFIED only, not screen-verified with real
@@ -1958,19 +1966,22 @@ recorded latency). But it surfaced a real, unresolved finding: the real
 translation leg FAILED against the real vLLM server
 (`translation_status: FAILED`, `translation: None`), despite
 `GPU-TRANSLATE-007` separately confirming that same server could
-translate correctly on 2026-08-12 -- something has changed or is
-misconfigured since then (dead process, wrong `VLLM_BASE_URL` on this
-venv/host, or a real client bug; the wire protocol doesn't carry the
-internal failure reason, so this isn't yet known). `GPU-E2E-002`, a
-small read-only diagnostic to pin that down, is now staged and
-`WAITING_FOR_USER` in `MANUAL_ACTIONS.md`. `LATENCY-001` is deliberately
-on hold until `GPU-E2E-002` resolves this -- measuring latency against a
-translation backend already known to be failing would produce misleading
-numbers. The user instructed Claude not to connect to or operate the GPU
-server itself and to prepare only the next manual command set each time;
-`GPU-E2E-002` is that next command set. Neither remaining action's result
-is required to close out Phase 11's own local scope. Do not begin any
-further work (these staged actions beyond preparing the next
+translate correctly on 2026-08-12. The follow-up diagnostic,
+`GPU-E2E-002`, PASSED (2026-08-14) and conclusively found why: not a
+config bug, not a client bug -- the vLLM server from `GPU-TRANSLATE-005`
+is simply not running on this host right now (no process, connection
+refused on port 8000). `GPU-TRANSLATE-008`, which restarts it using
+`GPU-TRANSLATE-004`/`005`'s already-proven launch procedure, is now
+staged and `WAITING_FOR_USER` in `MANUAL_ACTIONS.md`. `GPU-E2E-001`
+should be re-run afterward to confirm translation actually works
+end-to-end before `LATENCY-001` (still deliberately on hold) runs --
+measuring latency against a translation backend already known to be down
+would produce misleading numbers. The user instructed Claude not to
+connect to or operate the GPU server itself and to prepare only the next
+manual command set each time; `GPU-TRANSLATE-008` is that next command
+set. None of these remaining actions' results are required to close out
+Phase 11's own local scope. Do not begin any further work (these staged
+actions beyond preparing the next
 command set, the gateway-wiring gap, or anything else) without the user's
 explicit direction. Take a local snapshot first
 (`python scripts/local_backup.py --label <name>`) -- as the very first

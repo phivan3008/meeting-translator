@@ -4,103 +4,123 @@ Claude ghi các thao tác mà người dùng cần thực hiện tại đây.
 
 ## Pending actions
 
-One diagnostic action (`GPU-E2E-002`) plus one action from Phase 11's
-original staging (`LATENCY-001`, on hold -- see below). Neither is
-required to close out Phase 11's own local scope. `WINDOWS-PACKAGE-001`
-and `GPU-E2E-001` have both PASSED -- see "Completed actions" below
-(`GPU-E2E-001`'s pass carries a real caveat that motivated `GPU-E2E-002`).
+One action to restart the vLLM server (`GPU-TRANSLATE-008`) plus one
+action from Phase 11's original staging (`LATENCY-001`, on hold -- see
+below). Neither is required to close out Phase 11's own local scope.
+`WINDOWS-PACKAGE-001`, `GPU-E2E-001` and `GPU-E2E-002` have all PASSED --
+see "Completed actions" below (`GPU-E2E-002`'s diagnostic is what found
+that the vLLM server simply isn't running right now, motivating
+`GPU-TRANSLATE-008`).
 
-### Action ID: GPU-E2E-002
+### Action ID: GPU-TRANSLATE-008
 
 - Status: WAITING_FOR_USER
-- Purpose: `GPU-E2E-001` passed its own (deliberately loose) assertions,
-  but the real translation leg it exercised actually FAILED against the
-  real vLLM server (`translation_status: FAILED`, `translation: None`) --
-  a genuine, unresolved finding, not a test-tooling gap. The wire
-  protocol's `UtteranceFinal` message doesn't carry the internal failure
-  reason, only the status, so this action gets that reason directly:
-  confirm the vLLM server from `GPU-TRANSLATE-005` is actually still
-  running and reachable at whatever `VLLM_BASE_URL` this venv/host
-  resolves to, and get a real translation request's actual error (if any)
-  straight from the server side. Do not run `LATENCY-001` until this is
-  resolved -- latency numbers against a broken translation backend would
-  be misleading.
-- Run on: Same host/venv as `GPU-E2E-001`'s attempt 2 (the `.venv-asr` with
-  `faster-whisper` installed), or wherever the vLLM server from
-  `GPU-TRANSLATE-005` is actually running if that's a different host.
-- Prerequisites: Same venv as `GPU-E2E-001`. No new installs needed.
-- Safety notes: Read-only -- a `/health`/`/v1/models` check (matching
-  `GPU-TRANSLATE-006`'s precedent) plus one real chat-completion request
-  through the project's own prompt builder (matching `GPU-TRANSLATE-007`'s
-  precedent). Does not restart, stop or reconfigure anything.
+- Purpose: `GPU-E2E-002` conclusively found that the vLLM server from
+  `GPU-TRANSLATE-005` is not running on this host at all right now (no
+  process, connection refused on port 8000) -- not a config or client
+  bug. Restart it so `GPU-E2E-001` and (afterward) `LATENCY-001` can be
+  meaningfully re-run. Reuses the exact launch procedure already proven
+  to work in `GPU-TRANSLATE-004`/`GPU-TRANSLATE-005`, including the known
+  `flashinfer` `array.array[int]` import-time bug and its patch (see
+  `docs/OPERATOR_RUNBOOK_SEED.md`'s "Prerequisites and GPU compatibility"
+  -- that patch is venv-scoped and does not survive a `flashinfer`/`vllm`
+  reinstall, so it may or may not still be needed here).
+- Run on: The translation GPU host (same physical host as ASR, per
+  `GPU-TRANSLATE-001`), in `.venv-translate`.
+- Prerequisites: This project's source present; the downloaded
+  `Qwen3.6-27B-FP8` weights from `GPU-TRANSLATE-002` still on disk (verify
+  the path below with `ls` first -- prior sessions' docs inconsistently
+  spelled the project directory `meetting-translator` vs
+  `meeting-translator`; `GPU-E2E-001`/`GPU-E2E-002`'s pytest output this
+  session showed the correct single-"t" spelling, but don't assume that
+  carries over to `/workspace/models/...` or `.venv-translate`'s
+  location -- confirm on this host directly).
+- Safety notes: Starts a real, resource-heavy background process (~72 GB
+  GPU memory when loaded, per `GPU-TRANSLATE-005`). Does not touch ASR,
+  does not delete or modify the downloaded weights. If a stale/zombie
+  `vllm serve` process is somehow still holding the port despite `pgrep`
+  finding nothing in `GPU-E2E-002`, step 1 below will surface that before
+  a conflicting launch is attempted.
 - Commands:
   ```bash
-  cd /workspace/meeting-translator   # adjust to the real path on this host
-  source .venv-asr/bin/activate       # or the equivalent venv
+  cd /workspace/meeting-translator   # adjust to the real path on this host -- verify with `ls`
+  ls models/                          # confirm Qwen3.6-27B-FP8 is still present before proceeding
+  source .venv-translate/bin/activate # if this venv is missing, stop and report back rather than recreating it blind
 
-  # 1. What does this venv's .env actually resolve vllm_base_url to?
-  #    (Settings reads it from .env directly -- a shell $VLLM_BASE_URL may
-  #    be unset even if .env has it, so resolve it in Python, not bash.)
-  RESOLVED_URL=$(python -c "from shared.settings import Settings; print(Settings().vllm_base_url)")
-  echo "resolved vllm_base_url=$RESOLVED_URL"
-  BASE_URL=${RESOLVED_URL%/v1}   # /health and /v1/models both hang off the root, not /v1
+  # 1. Confirm nothing is already listening on the target port.
+  pgrep -fa "vllm serve" || echo "confirmed: no vllm serve process running"
 
-  # 2. Is the vLLM server process still running (may be on a different host)?
-  pgrep -fa "vllm serve" || echo "no vllm serve process found on this host"
+  # 2. Launch, matching GPU-TRANSLATE-004/005's proven flags exactly
+  #    (adjust the model path/port only if step "ls models/" above showed
+  #    something different from this).
+  nohup vllm serve /workspace/meeting-translator/models/Qwen3.6-27B-FP8 \
+      --served-model-name qwen3.6-27b-translate \
+      --max-model-len 4096 \
+      --enforce-eager \
+      --port 8000 \
+      > vllm_serve.log 2>&1 &
+  disown
+  sleep 30
+  tail -n 60 vllm_serve.log
 
-  # 3. Health/model check against the actually-resolved URL.
-  curl -s -o /dev/null -w "http_status=%{http_code}\n" "$BASE_URL/health" || echo "unreachable"
-  curl -s "$BASE_URL/v1/models"
-
-  # 4. One real translation request with the actual error surfaced, not swallowed.
-  cat > /tmp/translate_diag.py << 'EOF'
-  import asyncio
-  from server.translation.types import TranslationConfig
-  from server.translation.client import VllmTranslationClient
-  from shared.settings import Settings
-
-  async def main() -> None:
-      settings = Settings()
-      config = TranslationConfig.from_settings(settings)
-      print(f"vllm_base_url={config.base_url!r} model={config.model!r}")
-      client = VllmTranslationClient(config)
-      try:
-          text = await client.complete_chat(
-              system_prompt="Translate Japanese to Vietnamese. Output only the translation.",
-              user_content="こんにちは",
-              max_tokens=64,
-          )
-          print(f"OK: {text!r}")
-      except Exception as exc:
-          print(f"ERROR: {type(exc).__name__}: {exc}")
-      finally:
-          await client.aclose()
-
-  asyncio.run(main())
+  # 3. If the log shows the flashinfer TypeError again (search for
+  #    "array.array' is not subscriptable"), the venv-scoped patch from
+  #    GPU-TRANSLATE-005 didn't survive and needs reapplying. Otherwise
+  #    skip straight to step 4.
+  grep -q "is not subscriptable" vllm_serve.log && python3 - << 'EOF'
+  import re
+  import flashinfer.comm.fd_exchange as m
+  from pathlib import Path
+  path = Path(m.__file__)
+  text = path.read_text()
+  pattern = r'(?<!["\'])array\.array\[int\](?!["\'])'
+  if re.search(pattern, text):
+      path.write_text(re.sub(pattern, '"array.array[int]"', text))
+      print("patched OK")
+  else:
+      print("pattern not found -- file may differ from GPU-TRANSLATE-005's; do not guess further, report back")
   EOF
-  PYTHONPATH=/workspace/meeting-translator python /tmp/translate_diag.py
+  # If the patch step printed "patched OK", relaunch (repeat step 2's
+  # nohup command, then re-check the log as in step 2).
+
+  # 4. Once the log shows a clean startup ("Application startup complete."
+  #    / "API server: HTTP server started", matching GPU-TRANSLATE-005),
+  #    verify over HTTP exactly as GPU-TRANSLATE-006 did.
+  curl -s -o /dev/null -w "http_status=%{http_code}\n" http://localhost:8000/health
+  curl -s http://localhost:8000/v1/models
+  nvidia-smi --query-gpu=memory.used,memory.total --format=csv
   ```
-- Expected success indicators: Step 1 prints a non-empty URL. Step 2 shows
-  a running `vllm serve` process (on whichever host it's supposed to be
-  on). Step 3's health check returns `http_status=200` and the models list
-  matches `GPU-TRANSLATE-006`'s `qwen3.6-27b-translate`. Step 4 prints
-  `OK: '...'` with real translated text. Any of these failing pinpoints
-  exactly where the chain breaks (unset config vs. dead process vs.
-  unreachable network vs. a real client/prompt bug) -- that is a useful,
-  expected outcome of this diagnostic, not itself a failure of the action.
-  Expected artifacts: None permanent; `/tmp/translate_diag.py` is
-  temporary.
-- Rollback or cleanup: `rm /tmp/translate_diag.py`.
+- Expected success indicators: Step 1 confirms no conflicting process.
+  Step 2's log reaches "Application startup complete." with no traceback
+  (if the flashinfer bug recurs instead, that is itself useful signal --
+  proceed to step 3, don't treat it as a dead end). Step 4's `/health`
+  returns `http_status=200`, `/v1/models` lists `qwen3.6-27b-translate`
+  with `max_model_len:4096` (matching `GPU-TRANSLATE-006` exactly), and
+  `nvidia-smi` shows substantial GPU memory in use (~72 GB total is
+  consistent with weights + KV cache, matching `GPU-TRANSLATE-005`) with
+  no OOM.
+  Expected artifacts: `vllm_serve.log` in the project root (same as
+  `GPU-TRANSLATE-003`-`005`'s precedent -- keep it local, paste the
+  relevant excerpt back rather than the whole file if it's large).
+- Rollback or cleanup: If something goes wrong and needs to be stopped:
+  `pkill -f "vllm serve"`. No other cleanup needed.
 - Return to Claude (secrets/hostnames redacted):
-  - Exact commands used and their output for all four steps.
-  - If step 4 errors, the full `ERROR: ...` line.
+  - Whether `models/Qwen3.6-27B-FP8` and `.venv-translate` were both
+    present as expected, or the paths differed (paste what `ls` actually
+    showed if so).
+  - Whether the flashinfer patch (step 3) was needed this time or not.
+  - The final `vllm_serve.log` excerpt showing startup success (or
+    failure, if it didn't start).
+  - The `/health` status code, the `/v1/models` response, and the
+    `nvidia-smi` memory line.
 
 ### Action ID: LATENCY-001
 
-- Status: WAITING_FOR_USER (**on hold** -- do not run until `GPU-E2E-002`
-  resolves the translation-failure finding above; running it now would
-  measure latency against a translation backend already known to be
-  failing)
+- Status: WAITING_FOR_USER (**on hold** -- do not run until
+  `GPU-TRANSLATE-008` gets the vLLM server running again and `GPU-E2E-001`
+  is re-run to confirm translation actually works end-to-end; running it
+  now would measure latency against a translation backend already known
+  to be down)
 - Purpose: Get the first-ever *real* hardware latency numbers for this
   project -- every latency measurement so far (Phase 11's local smoke
   runs of `scripts/latency_report.py`) has been against fake backends.
@@ -185,6 +205,25 @@ and `GPU-E2E-001` have both PASSED -- see "Completed actions" below
   entries. `GPU-E2E-002` is a small, read-only diagnostic to find out why
   translation failed before `LATENCY-001` (which is on hold until this is
   resolved) runs.
+
+### Action ID: GPU-E2E-002
+
+- Status: PASSED (2026-08-14) -- root cause conclusively found.
+- Result summary: `vllm_base_url` resolved correctly
+  (`http://localhost:8000/v1`) -- not a config bug. `pgrep -fa "vllm
+  serve"` found no process. `curl .../health` returned `http_status=000`
+  (connection refused, not a timeout or HTTP error). A direct
+  `VllmTranslationClient.complete_chat()` call raised
+  `TranslationOverloadedError: All connection attempts failed` -- the
+  client correctly classified the raw connection failure, working exactly
+  as designed (`classify_backend_error`), not a client bug either.
+- Purpose: Find out why `GPU-E2E-001`'s real translation leg returned
+  `TranslationStatus.FAILED` against the real vLLM server, since the wire
+  protocol doesn't carry the internal failure reason.
+- Run on: Same host/venv as `GPU-E2E-001`.
+- Note: Root cause is simply that the vLLM server from `GPU-TRANSLATE-005`
+  is not currently running on this host -- no code defect anywhere in
+  this project. `GPU-TRANSLATE-008` (Pending actions) restarts it.
 
 ### Action ID: WINDOWS-UI-007
 
