@@ -125,13 +125,15 @@ from what still needs hardware.
 
 ## Development workflow
 
-This project does not use Git. Every change is made directly in the local
-project directory, with timestamped local snapshots (`scripts/local_backup.py`
--> `.local_backups/`, excluding virtual environments, model weights,
-caches, logs, audio recordings and secrets) instead of version-control
-history. GPU-server operations are never executed automatically -- every
-one is prepared as an exact, reviewable command set in `MANUAL_ACTIONS.md`
-for the operator to run and report back, per `GPU_MANUAL_WORKFLOW.md`. The
-full phase-by-phase implementation prompts used to build this project are
-in `prompts/phases/`; `CLAUDE.md` is the binding rule set for how work here
-is done.
+This project is tracked in Git (`origin` at
+`https://github.com/phivan3008/meeting-translator.git`, branch `master`).
+Changes are also protected by timestamped local snapshots
+(`scripts/local_backup.py` -> `.local_backups/`, excluding virtual
+environments, model weights, caches, logs, audio recordings and secrets)
+taken before editing -- git history and local snapshots are both kept, one
+does not replace the other. GPU-server operations are never executed
+automatically -- every one is prepared as an exact, reviewable command set
+in `MANUAL_ACTIONS.md` for the operator to run and report back, per
+`GPU_MANUAL_WORKFLOW.md`. The full phase-by-phase implementation prompts
+used to build this project are in `prompts/phases/`; `CLAUDE.md` is the
+binding rule set for how work here is done.

@@ -4,12 +4,14 @@
 
 Build a production-oriented Windows desktop client and GPU-backed server for near-real-time Vietnamese-Japanese meeting transcription and translation.
 
-## Mandatory local-only policy
+## Mandatory local-and-git policy
 
-- This project does not use Git.
-- Never run or request Git commands.
+- This project is tracked in Git, remote `origin` at `https://github.com/phivan3008/meeting-translator.git`, branch `master` (since 2026-08-14).
+- Commit at logical checkpoints (e.g., finishing a phase, a manual-action tracking-file update, a bug fix) rather than after every single file edit.
+- Push each commit to `origin/master` automatically once created, unless the user says otherwise for a specific change.
+- Never force-push, rewrite history (`rebase`, `commit --amend` on already-pushed commits), delete branches, or skip hooks (`--no-verify`) without explicit user instruction for that specific action.
+- Still take a timestamped local snapshot before editing, per `LOCAL_WORKFLOW.md` -- git history and local snapshots are both kept; neither replaces the other.
 - Work only with files in the user's local project directory unless explicitly preparing instructions.
-- Use timestamped local snapshots for rollback according to `LOCAL_WORKFLOW.md`.
 - Never directly access or operate the GPU server.
 - For every GPU-server operation, follow `GPU_MANUAL_WORKFLOW.md`, write an action to `MANUAL_ACTIONS.md`, and stop for user feedback.
 - Never assume a manual command succeeded.
@@ -37,7 +39,8 @@ Build a production-oriented Windows desktop client and GPU-backed server for nea
 7. If Windows hardware or GPU verification is needed, prepare exact manual instructions and stop.
 8. Analyze user-provided output before continuing.
 9. Update status and documentation truthfully.
-10. Do not delete or weaken tests to obtain a pass.
+10. Commit at a logical checkpoint and push to `origin/master`, per "Mandatory local-and-git policy".
+11. Do not delete or weaken tests to obtain a pass.
 
 ## Fixed architecture
 

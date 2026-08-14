@@ -1,13 +1,26 @@
-# Local-Only Development Workflow
+# Local Development and Version Control Workflow
 
-## Không sử dụng Git
+## Sử dụng Git
 
-Claude không được:
+Kể từ 2026-08-14, project này được theo dõi bằng Git, remote `origin` tại
+`https://github.com/phivan3008/meeting-translator.git`, branch `master`.
 
-- Chạy lệnh `git`.
-- Yêu cầu tạo repository.
-- Yêu cầu commit, branch, tag, stash hoặc pull request.
-- Dựa vào Git để xem thay đổi hoặc khôi phục file.
+Claude được phép:
+
+- Chạy `git status`, `git diff`, `git log`, `git add`, `git commit`,
+  `git push` tới `origin/master`.
+- Commit tại các mốc hợp lý (kết thúc một phase, một cập nhật file theo
+  dõi thao tác thủ công, một bugfix) thay vì sau mỗi lần sửa file.
+- Push tới `origin/master` ngay sau khi commit, trừ khi người dùng yêu
+  cầu khác cho một thay đổi cụ thể.
+
+Claude vẫn không được, trừ khi người dùng yêu cầu rõ ràng cho thao tác cụ
+thể đó:
+
+- `push --force`, `reset --hard`, `rebase -i`, xóa branch, hoặc bỏ qua
+  hook (`--no-verify`).
+- Dựa vào Git để thay thế snapshot local -- cả hai được duy trì song
+  song, xem phần "Quản lý thay đổi local" bên dưới.
 
 ## Quản lý thay đổi local
 
