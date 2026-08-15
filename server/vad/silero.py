@@ -14,9 +14,12 @@ probability is returned for intermediate frames.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from server.vad.types import SAMPLE_RATE_HZ
+
+_LOG = logging.getLogger("server.vad.silero")
 
 # Silero 16 kHz analysis window size in samples.
 _WINDOW_SAMPLES = 512
@@ -58,7 +61,11 @@ class SileroVadModel:
         tensor = torch.from_numpy(samples)
         with torch.no_grad():
             score = self._model(tensor, SAMPLE_RATE_HZ)
-        return float(score.item())
+        probability = float(score.item())
+        # DEBUG-only: not raw audio, just a scalar score -- opt in with
+        # LOG_LEVEL=DEBUG when diagnosing segmentation timing.
+        _LOG.debug("silero window probability=%.4f", probability)
+        return probability
 
     def reset(self) -> None:
         self._buffer.clear()
