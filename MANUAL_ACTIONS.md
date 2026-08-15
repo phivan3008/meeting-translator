@@ -4,13 +4,15 @@ Claude ghi các thao tác mà người dùng cần thực hiện tại đây.
 
 ## Pending actions
 
-Two actions staged after `UtteranceOrchestrator` was wired into the live
-gateway (2026-08-15, at the user's direction). Neither is required to
+Three actions staged after `UtteranceOrchestrator` was wired into the
+live gateway (2026-08-15, at the user's direction). None is required to
 close out that work's own local scope (it is already LOCAL_VERIFIED with
 scripted doubles) -- these are the real-hardware acceptance test for it,
-per `CLAUDE.md`'s "never claim hardware verification from mocks", and a
-diagnostic for a real, unresolved stall found while running it.
-`GATEWAY-E2E-001` is on hold pending `GATEWAY-E2E-002`'s diagnosis.
+per `CLAUDE.md`'s "never claim hardware verification from mocks", and
+the diagnostic trail for a real, unresolved finding hit while running
+it. `GATEWAY-E2E-001` is on hold pending `GATEWAY-E2E-003`'s test of the
+current leading hypothesis (`GATEWAY-E2E-002`'s own diagnostic tool,
+`py-spy`, turned out to be unusable on this host -- see its entry).
 
 ### Action ID: GATEWAY-E2E-001
 
@@ -253,9 +255,199 @@ diagnostic for a real, unresolved stall found while running it.
     `transcription`/`translation`/`translation_status` values.
   - Any error, OOM, or connection failure observed.
 
-### Action ID: GATEWAY-E2E-002
+### Action ID: GATEWAY-E2E-003
 
 - Status: WAITING_FOR_USER
+- Purpose: `GATEWAY-E2E-002`'s `py-spy dump` failed -- `ptrace` is blocked
+  in this host's container even as root ("Permission denied", no `sudo`
+  available). But its other two findings are still real evidence:
+  `/health/live` responded instantly during the "stall" (the event loop
+  itself is not stuck), and `nvidia-smi` showed **0% GPU utilization**
+  while ~79.6 GiB was held -- nothing was actually computing. Combined
+  with the complete absence of a 4th `faster_whisper Processing audio`
+  line, this points away from "a hung decode" and toward a simpler
+  explanation: **the utterance may never be finalizing at all.** Real
+  Silero VAD's probability for the test's all-zero silence frames may
+  not drop convincingly below `vad_threshold` (0.5) within the 60
+  frames (1.2s) previously sent -- unlike the scripted VAD used
+  everywhere else in this project's tests, which returns a clean, fixed
+  0.1 for "silence" -- so `hard_silence_ms` (900ms of consecutive
+  below-threshold frames) may simply never be reached, meaning
+  `_finalize_utterance` is never spawned in the first place (matching
+  0% GPU utilization: there is nothing running because nothing was ever
+  asked to run). A new DEBUG-level log line was added to
+  `SileroVadModel.probability()` (commit `d78a6af`) to make the real
+  probability trend directly observable -- a scalar float per window,
+  not audio content, gated by `LOG_LEVEL=DEBUG`. This action tests the
+  hypothesis directly: send much more trailing silence (400 frames, 8s
+  -- generously past any plausible VAD settling time) and watch the
+  probability log.
+- Run on: Same host/venv as `GATEWAY-E2E-001`/`002`.
+- Prerequisites: `git pull` first, to get the new logging line -- confirm
+  with `git log -1 --oneline` showing `d78a6af` or later.
+- Safety notes: Same as `GATEWAY-E2E-001`/`002` (real GPU memory, real
+  synthetic sine tone, no personal audio). `LOG_LEVEL=DEBUG` will make
+  the server log substantially more verbose (every VAD window, plus
+  library-internal debug lines) -- expected and fine for this one
+  diagnostic run, not meant to be a permanent setting.
+- Commands:
+  ```bash
+  cd /workspace/meeting-translator
+  source .venv-asr/bin/activate
+  git pull
+  git log -1 --oneline   # confirm the new SileroVadModel logging is present
+
+  pkill -f "uvicorn server.app:app" 2>/dev/null
+  sleep 1
+  LOG_LEVEL=DEBUG nohup uvicorn server.app:app --host 127.0.0.1 --port 3000 > gateway_e2e_server.log 2>&1 &
+  disown
+  sleep 5
+  curl -s http://127.0.0.1:3000/health/live
+
+  # Same client, but with 400 silence frames (8s) instead of 60 (1.2s).
+  cat > /tmp/gateway_e2e_client.py << 'EOF'
+  import asyncio
+  import json
+  import math
+  import struct
+  from datetime import UTC, datetime
+
+  import websockets
+
+  from shared.protocol.binary import AudioFlags, encode_packet
+  from shared.protocol.enums import Language, StreamSource
+  from shared.protocol.messages import SessionStart, StreamConfig
+
+  FRAME_MS = 20
+  SAMPLE_RATE = 16000
+  FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
+  SILENCE_FRAME_COUNT = 400  # 8s -- generously past any plausible VAD settling time
+
+  def sine_frame(frame_index: int, frequency_hz: float = 220.0, amplitude: float = 0.2) -> bytes:
+      samples = []
+      for i in range(FRAME_SAMPLES):
+          t = (frame_index * FRAME_SAMPLES + i) / SAMPLE_RATE
+          value = amplitude * math.sin(2 * math.pi * frequency_hz * t)
+          samples.append(int(value * 32767))
+      return struct.pack(f"<{FRAME_SAMPLES}h", *samples)
+
+  def silence_frame() -> bytes:
+      return b"\x00\x00" * FRAME_SAMPLES
+
+  async def main() -> None:
+      session_start = SessionStart(
+          session_id="sess-gateway-e2e-003",
+          client_id="gateway-e2e-client",
+          timestamp=datetime.now(UTC),
+          streams=[
+              StreamConfig(
+                  stream_number=1,
+                  stream_id="mic-01",
+                  source=StreamSource.MICROPHONE,
+                  source_language=Language.JAPANESE,
+                  target_language=Language.VIETNAMESE,
+              )
+          ],
+      )
+      async with websockets.connect("ws://127.0.0.1:3000/ws/stream") as ws:
+          await ws.send(session_start.model_dump_json())
+
+          seq = 0
+          for i in range(75):
+              packet = encode_packet(
+                  stream_number=1, sequence_number=seq, client_timestamp_ms=seq * FRAME_MS,
+                  payload=sine_frame(i),
+              )
+              await ws.send(packet)
+              seq += 1
+          for _ in range(SILENCE_FRAME_COUNT):
+              packet = encode_packet(
+                  stream_number=1, sequence_number=seq, client_timestamp_ms=seq * FRAME_MS,
+                  payload=silence_frame(),
+              )
+              await ws.send(packet)
+              seq += 1
+
+          final_seen = False
+          for _ in range(60):
+              try:
+                  raw = await asyncio.wait_for(ws.recv(), timeout=3)
+              except asyncio.TimeoutError:
+                  seq += 1
+                  await ws.send(
+                      encode_packet(
+                          stream_number=1, sequence_number=seq,
+                          client_timestamp_ms=seq * FRAME_MS, payload=b"",
+                          flags=AudioFlags.KEEPALIVE,
+                      )
+                  )
+                  continue
+              event = json.loads(raw)
+              if event["type"] in ("transcription.partial", "utterance.final", "error"):
+                  print(f"{event['type']}: {event}")
+              if event["type"] == "utterance.final":
+                  final_seen = True
+                  break
+          if not final_seen:
+              print("TIMED OUT waiting for utterance.final")
+
+  asyncio.run(main())
+  EOF
+  PYTHONPATH=/workspace/meeting-translator python /tmp/gateway_e2e_client.py > /tmp/gateway_e2e_client.log 2>&1
+  cat /tmp/gateway_e2e_client.log
+
+  # Pull out just the VAD probability trend for the silence portion, plus
+  # anything ASR/finalize-related, so the log excerpt to paste back is
+  # manageable rather than the full (very verbose) DEBUG log.
+  echo "=== VAD probability trend (last 60 lines) ==="
+  grep "silero window probability" gateway_e2e_server.log | tail -60
+  echo "=== ASR / finalize activity ==="
+  grep -E "faster_whisper|UtteranceFinal|error" gateway_e2e_server.log
+
+  pkill -f "uvicorn server.app:app"
+  ```
+- Expected success indicators: The probability log shows real numbers --
+  ideally a clear drop from high (during the sine tone) to low (during
+  silence) within the first several silence frames, in which case
+  `utterance.final` should now appear (confirming the hypothesis: the
+  test's original 60 silence frames just weren't enough for real VAD,
+  not a wiring bug). If probability *never* drops meaningfully below
+  0.5 even after 8s of pure digital silence, that is a different, more
+  concerning finding worth its own follow-up (real VAD misbehavior on
+  this input, or a bug in how frames reach it) -- report the actual
+  numbers either way, don't just report pass/fail.
+  Expected artifacts: `gateway_e2e_server.log` (large, DEBUG-level --
+  the two `grep` excerpts above are what to paste back, not the whole
+  file), `/tmp/gateway_e2e_client.log`.
+- Rollback or cleanup: `pkill -f "uvicorn server.app:app"` if still
+  running.
+- Return to Claude (secrets/hostnames redacted):
+  - The `git log -1 --oneline` output (confirms the new code was pulled).
+  - The full client script output (`transcription.partial`/
+    `utterance.final`/`TIMED OUT` lines).
+  - The VAD probability trend excerpt (paste as many of the `tail -60`
+    lines as came out -- the actual numbers matter here).
+  - The ASR/finalize activity excerpt.
+
+### Action ID: GATEWAY-E2E-002
+
+- Status: WAITING_FOR_USER (result in -- `py-spy` itself unusable on
+  this host; see below. Superseded by `GATEWAY-E2E-003`, not retried.)
+- Result (2026-08-15): `py-spy dump` failed even running as root:
+  `Error: Failed to copy Py_Version symbol / Permission denied (os error
+  13)`, and `sudo` isn't installed in this container to try harder --
+  `ptrace` is blocked at the container level, not a user-permission
+  issue `py-spy`'s own fallback could work around. Two other findings
+  from this action ARE real and useful, though: `curl -m 5
+  http://127.0.0.1:3000/health/live` responded instantly during the
+  "stalled" window (the event loop itself is not stuck), and `nvidia-smi`
+  showed **0% GPU utilization** (`79639 MiB, 81559 MiB, 0 %`) while GPU
+  memory stayed high -- nothing was actually computing. Combined with the
+  same 3-partials-then-nothing pattern as attempt 2, this shifted the
+  leading hypothesis away from "a hung decode" and toward "the utterance
+  never finalizes at all" (real Silero VAD's probability may not drop
+  below threshold within the test's silence budget, unlike the scripted
+  VAD used everywhere else). `GATEWAY-E2E-003` tests that directly.
 - Purpose: `GATEWAY-E2E-001`'s two attempts both got real partial
   transcriptions but never a final event, with the second attempt ruling
   out the idle-timeout explanation from the first. The server log shows

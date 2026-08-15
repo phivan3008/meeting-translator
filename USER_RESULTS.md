@@ -1156,6 +1156,50 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   `py-spy dump` of the live server process while it's in this stalled
   state to see exactly where it's stuck, rather than guessing further.
 
+### GATEWAY-E2E-002
+
+- Date: 2026-08-15
+- Environment: GPU server, `.venv-asr`, fresh server restart on
+  `127.0.0.1:3000` (PID printed: 2065763).
+- Command summary: `pip install py-spy`, restart server, run the
+  attempt-2 client script in the background, `sleep 20`, then
+  `curl -m 5 .../health/live`, `py-spy dump --pid $SERVER_PID` (with a
+  `sudo -E` fallback), `nvidia-smi --query-gpu=...`.
+- Exit status: `py-spy dump` failed both without and with the attempted
+  `sudo` fallback (`sudo: command not found` -- no sudo in this
+  container at all). Everything else ran cleanly.
+- Result: Primary diagnostic tool unusable on this host, but two
+  meaningful secondary findings obtained anyway.
+- Relevant output summary:
+  - `py-spy dump`: `Error: Failed to copy Py_Version symbol / Caused by:
+    0: Permission denied (os error 13) / 1: Permission denied (os error
+    13)`. `sudo: command not found`.
+  - `/health/live` during the presumed-stalled window: responded
+    immediately with `{"status":"alive","app_env":"development"}`.
+  - `nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu`:
+    `79639 MiB, 81559 MiB, 0 %`.
+  - Client repeated the identical 3-partials-then-timeout pattern from
+    `GATEWAY-E2E-001`'s attempt 2 (same content, same behavior).
+  - Server log repeated the identical pattern too: 3
+    `faster_whisper Processing audio` lines, then nothing until the
+    client's own eventual disconnect.
+- Redacted raw output file, if any: none.
+- Follow-up: `py-spy` cannot be used on this host -- `ptrace` is blocked
+  at the container level (confirmed by failing even as root with no
+  `sudo` fallback available), not a fixable permissions issue from
+  inside the container. The two findings that *did* come through are
+  real signal: the event loop itself is responsive (rules out a
+  whole-process deadlock), and 0% GPU utilization during the stall rules
+  out "actively computing, just slow" -- nothing was running on the GPU
+  at all. This reframes the leading hypothesis: the utterance likely
+  never finalizes in the first place (real Silero VAD's probability may
+  not drop below `vad_threshold` within the test's 60 silence frames,
+  unlike the scripted VAD used everywhere else in this project, which
+  returns a clean fixed low value), rather than a hung finalize task.
+  `GATEWAY-E2E-003` (see `MANUAL_ACTIONS.md`) adds a DEBUG-level
+  probability log to `SileroVadModel` and retries with much more
+  trailing silence (400 frames / 8s) to test this directly.
+
 ## Result template
 
 ```markdown
