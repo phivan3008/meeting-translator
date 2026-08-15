@@ -36,6 +36,7 @@ segmenter still reports the same utterance as open.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
 from collections.abc import AsyncIterator, Coroutine
 from contextlib import asynccontextmanager
@@ -73,6 +74,8 @@ from server.vad.state_machine import UtteranceSegmenter
 from server.vad.types import Utterance, VadConfig
 from shared.protocol.enums import FinalReason, Language, StreamSource, TranslationStatus
 from shared.protocol.messages import TranscriptionPartial
+
+_LOG = logging.getLogger("server.orchestration.pipeline")
 
 
 @dataclass
@@ -231,6 +234,11 @@ class UtteranceOrchestrator:
             state.pending_gen[event.utterance_id] = state.pending_gen.get(event.utterance_id, 0) + 1
         elif isinstance(event, UtteranceFinalized):
             utterance = event.utterance
+            _LOG.debug(
+                "utterance %s finalized reason=%s -- spawning finalize task",
+                utterance.utterance_id,
+                utterance.final_reason,
+            )
             state.pending_gen[utterance.utterance_id] = (
                 state.pending_gen.get(utterance.utterance_id, 0) + 1
             )
@@ -324,9 +332,14 @@ class UtteranceOrchestrator:
             await self._do_finalize_utterance(stream_id, utterance)
 
     async def _do_finalize_utterance(self, stream_id: str, utterance: Utterance) -> None:
+        _LOG.debug("finalize task started for utterance %s", utterance.utterance_id)
         state = self._streams[stream_id]
         revision = self._partial.current_revision(utterance.utterance_id) + 1
         try:
+            _LOG.debug(
+                "finalize task calling final_transcriber.finalize for utterance %s",
+                utterance.utterance_id,
+            )
             final_event = await self._final_transcriber.finalize(
                 utterance,
                 session_id=self._session_id,
@@ -335,13 +348,23 @@ class UtteranceOrchestrator:
                 target_language=state.target_language,
                 revision=revision,
             )
+            _LOG.debug("finalize task got final_event for utterance %s", utterance.utterance_id)
         except AsrError as exc:
+            _LOG.debug(
+                "finalize task caught AsrError for utterance %s: %s", utterance.utterance_id, exc
+            )
             await self._publish(
                 build_asr_error_event(
                     exc, session_id=self._session_id, utterance_id=utterance.utterance_id
                 )
             )
             return
+        except Exception:
+            _LOG.exception(
+                "finalize task raised an unexpected exception for utterance %s",
+                utterance.utterance_id,
+            )
+            raise
 
         transcription = final_event.transcription
         request: TranslationRequest | None = None
