@@ -4,17 +4,38 @@ Claude ghi các thao tác mà người dùng cần thực hiện tại đây.
 
 ## Pending actions
 
-One new action, `GATEWAY-E2E-001`, staged after `UtteranceOrchestrator`
-was wired into the live gateway (2026-08-15, at the user's direction).
-Not required to close out that work's own local scope (it is already
-LOCAL_VERIFIED with scripted doubles) -- this is the real-hardware
-acceptance test for it, per `CLAUDE.md`'s "never claim hardware
-verification from mocks".
+Two actions staged after `UtteranceOrchestrator` was wired into the live
+gateway (2026-08-15, at the user's direction). Neither is required to
+close out that work's own local scope (it is already LOCAL_VERIFIED with
+scripted doubles) -- these are the real-hardware acceptance test for it,
+per `CLAUDE.md`'s "never claim hardware verification from mocks", and a
+diagnostic for a real, unresolved stall found while running it.
+`GATEWAY-E2E-001` is on hold pending `GATEWAY-E2E-002`'s diagnosis.
 
 ### Action ID: GATEWAY-E2E-001
 
-- Status: WAITING_FOR_USER (attempt 1: real, meaningful partial success --
-  see below; this is the corrected retry)
+- Status: WAITING_FOR_USER (**on hold** -- two attempts done, a real
+  unresolved stall found on attempt 2; see `GATEWAY-E2E-002` below,
+  which should run first)
+- Attempt 1 result (2026-08-15): Real success -- three real
+  `transcription.partial` events arrived with real content from real
+  Silero VAD + real faster-whisper over the real live gateway (the exact
+  known Whisper hallucination on synthetic-tone input already seen in
+  `GPU-E2E-001`/`GPU-E2E-003`, with the stable-prefix promotion logic
+  visibly correct across revisions). No `utterance.final` arrived --the
+  connection was closed by the *server's own idle timeout* (WS close
+  code 1008) while real final ASR + real translation were still running
+  as a background task. Root cause: the test client stopped sending
+  anything after its test frames and just waited for a reply, unlike a
+  real client (`AudioSender`), which never stops streaming
+  frames/keepalives -- so the server had nothing to reset its idle timer
+  with while the background finalize work was in flight. This is a test
+  -script fidelity gap, not a wiring defect; see
+  `USER_RESULTS.md`'s `GATEWAY-E2E-001 (attempt 1)` for full detail.
+  Fixed below: the client now sends periodic `AudioFlags.KEEPALIVE`
+  frames while waiting for the final event, matching real client
+  behavior. Also note: port 8080 was already in use on this host last
+  time (unrelated process) -- the commands below default to 3000
 - Attempt 1 result (2026-08-15): Real success -- three real
   `transcription.partial` events arrived with real content from real
   Silero VAD + real faster-whisper over the real live gateway (the exact
@@ -35,6 +56,22 @@ verification from mocks".
   behavior. Also note: port 8080 was already in use on this host last
   time (unrelated process) -- the commands below default to 3000
   instead; adjust if that's also taken.
+- Attempt 2 result (2026-08-15): The keepalive fix worked as intended --
+  no more premature idle-timeout disconnect (`ConnectionClosedError`).
+  But `utterance.final` still never arrived: the client's full 180s
+  receive loop ran to completion and printed `TIMED OUT waiting for
+  utterance.final`, not an exception this time. The server log shows
+  exactly the same 3 partial-decode lines as attempt 1, then **no
+  further activity of any kind** for the full ~2m33s until the client's
+  own loop gave up and disconnected. No error event, no traceback. This
+  is a real, unresolved finding -- the background finalize task (a real
+  full-utterance faster-whisper decode, sharing the GPU with the
+  already-running vLLM server at ~76 of 81.5 GiB VRAM used) appears to
+  stall rather than crash, since `FinalTranscriber.finalize()` would
+  otherwise have logged its own "Processing audio" line unconditionally.
+  Full reasoning in `USER_RESULTS.md`'s `GATEWAY-E2E-001 (attempt 2)`
+  entry. Do not attempt a third blind retry -- `GATEWAY-E2E-002` gets a
+  live look at exactly where the server is stuck first.
 - Purpose: `UtteranceOrchestrator` is now wired into
   `server/transport/gateway.py`, proven with scripted ASR/translation/VAD
   doubles over the real websocket transport
@@ -215,6 +252,89 @@ verification from mocks".
   - Whether exactly one `utterance.final` arrived, and its
     `transcription`/`translation`/`translation_status` values.
   - Any error, OOM, or connection failure observed.
+
+### Action ID: GATEWAY-E2E-002
+
+- Status: WAITING_FOR_USER
+- Purpose: `GATEWAY-E2E-001`'s two attempts both got real partial
+  transcriptions but never a final event, with the second attempt ruling
+  out the idle-timeout explanation from the first. The server log shows
+  no error and no traceback -- consistent with the background finalize
+  task (a real full-utterance faster-whisper decode, competing for GPU
+  with the already-running ~76 GiB-used vLLM server) hanging rather than
+  crashing, but this is not confirmed. Get a live look at exactly where
+  the server process is stuck, instead of guessing further: `py-spy
+  dump` captures every Python (and native) thread's stack in a running
+  process without modifying or restarting it.
+- Run on: Same host/venv as `GATEWAY-E2E-001`.
+- Prerequisites: Same as `GATEWAY-E2E-001`, plus `pip install py-spy`.
+  `py-spy` needs ptrace permission to attach to another process -- if it
+  reports a permission error, retry with `sudo -E py-spy dump ...` (the
+  `-E` preserves the venv's `PATH`/environment) rather than giving up.
+- Safety notes: `py-spy dump` is read-only -- it does not pause, modify
+  or restart the target process. Same GPU-memory/OOM caveat as
+  `GATEWAY-E2E-001` (starting the server loads `large-v3` into GPU memory
+  alongside vLLM). Uses the same synthetic sine-tone client, no personal
+  audio.
+- Commands:
+  ```bash
+  cd /workspace/meeting-translator   # adjust to the real path on this host
+  source .venv-asr/bin/activate
+  pip install py-spy
+
+  pkill -f "uvicorn server.app:app" 2>/dev/null   # clear any leftover instance from prior attempts
+  sleep 1
+  nohup uvicorn server.app:app --host 127.0.0.1 --port 3000 > gateway_e2e_server.log 2>&1 &
+  disown
+  SERVER_PID=$!
+  sleep 5
+  echo "server_pid=$SERVER_PID"
+  curl -s http://127.0.0.1:3000/health/live
+
+  # Reuses the exact same /tmp/gateway_e2e_client.py from GATEWAY-E2E-001's
+  # retry (recreate it first if it's gone -- same script, unchanged).
+  python /tmp/gateway_e2e_client.py > /tmp/gateway_e2e_client.log 2>&1 &
+  CLIENT_PID=$!
+
+  # Prior attempts went quiet within ~3s of connecting; wait generously
+  # longer to be certain we catch it mid-stall, then dump.
+  sleep 20
+  echo "=== /health/live while (presumably) stalled ==="
+  curl -s -m 5 http://127.0.0.1:3000/health/live || echo "health check itself timed out"
+  echo "=== py-spy dump of the server process while stalled ==="
+  py-spy dump --pid $SERVER_PID || sudo -E py-spy dump --pid $SERVER_PID
+  echo "=== nvidia-smi snapshot ==="
+  nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv
+
+  # Let the client run to its own natural conclusion (up to ~180s more),
+  # then show what it saw and clean up.
+  wait $CLIENT_PID
+  cat /tmp/gateway_e2e_client.log
+  pkill -f "uvicorn server.app:app"
+  ```
+- Expected success indicators: The `/health/live` check during the
+  stalled window either responds promptly (confirms the event loop
+  itself is fine, isolated stall in this session's background task) or
+  itself times out (confirms a broader event-loop-level stall) -- either
+  answer is useful, not a pass/fail. The `py-spy dump` output is the main
+  deliverable: look for a thread whose stack is inside
+  `faster_whisper`/`ctranslate2`/`torch` C extension code (consistent
+  with a stuck GPU decode) versus one waiting on a lock/queue/network
+  call (a different kind of stall). `nvidia-smi` showing near-zero GPU
+  utilization during the stall would support "hung waiting on something,
+  not actively computing"; non-zero utilization would support "genuinely
+  still computing, just very slowly under contention."
+  Expected artifacts: `gateway_e2e_server.log`, `/tmp/gateway_e2e_client.log`
+  (both worth keeping this time, given the open question).
+- Rollback or cleanup: `pkill -f "uvicorn server.app:app"` if still
+  running.
+- Return to Claude (secrets/hostnames redacted):
+  - The `server_pid` printed and whether `/health/live` responded during
+    the stall or itself timed out.
+  - The full `py-spy dump` output (or the exact permission error if it
+    failed even with `sudo`).
+  - The `nvidia-smi` snapshot.
+  - Whatever the client script eventually printed/logged.
 
 ## Completed actions
 

@@ -1996,16 +1996,33 @@ section covers what was built and how it was verified.
   - **What is NOT yet true**: this wiring is LOCAL_VERIFIED with scripted
     doubles only. Real Silero VAD + real faster-whisper + real vLLM,
     driven through the actual live gateway with a real connected client,
-    has not been confirmed -- staged as `GATEWAY-E2E-001` in
-    `MANUAL_ACTIONS.md`, `WAITING_FOR_USER`. The separately-known
+    is **partially confirmed and partially an open, unresolved finding**:
+    `GATEWAY-E2E-001` (two attempts, 2026-08-15) got real
+    `transcription.partial` events with real content (real VAD, real
+    faster-whisper, real stable-prefix promotion, over the real live
+    gateway) both times -- genuine evidence the wiring's partial-decode
+    path works end to end on real hardware. Neither attempt got
+    `utterance.final`: attempt 1 hit a test-script fidelity gap (client
+    stopped sending, triggering the server's own idle timeout); attempt
+    2 fixed that (keepalives sent, matching real client behavior) but
+    still timed out, with the server log showing no further activity of
+    any kind after the 3rd partial -- no error, no traceback -- for over
+    two minutes, consistent with the background finalize task (a real
+    full-utterance decode, sharing the GPU with vLLM's ~76 of 81.5 GiB
+    used) stalling rather than crashing. Not yet root-caused.
+    `GATEWAY-E2E-002` is staged and `WAITING_FOR_USER` in
+    `MANUAL_ACTIONS.md` to get a live `py-spy dump` of the server process
+    while stalled, rather than guessing further; `GATEWAY-E2E-001` is on
+    hold pending that diagnosis. The separately-known
     `translation_queue_depth` Gauge cross-session limitation and the
     `--enforce-eager` translation-latency finding (`LATENCY-001`,
     translation p95 ~2.4s vs a <1.2s objective) are both unrelated,
     pre-existing, and explicitly out of scope for this change -- not
-    touched. UI acceptance criteria about partial/final/translation
-    *rendering* still remain LOCAL_VERIFIED only, not screen-verified
-    with real data -- `GATEWAY-E2E-001`'s real-hardware run is what would
-    finally let a real session drive that UI with real events.
+    touched, though the same GPU-contention pressure that produced the
+    latency finding is a plausible contributing factor to this new stall
+    too (not confirmed). UI acceptance criteria about partial/final/
+    translation *rendering* still remain LOCAL_VERIFIED only, not
+    screen-verified with real data.
 
 ## Next action
 
@@ -2028,22 +2045,35 @@ wiring change itself).
 **What this does and does not mean**: the wiring itself -- the code path
 from audio-in to caption-out over the real live websocket -- is now real
 and proven, with scripted ASR/translation/VAD doubles on CPU
-(`tests/test_transport_gateway_orchestration.py`). It has **not** been
-proven with real Silero VAD + real faster-whisper + real vLLM through the
-actual gateway, talking to a real connected client. That is staged as
-`GATEWAY-E2E-001` in `MANUAL_ACTIONS.md`, `WAITING_FOR_USER` --
-per `CLAUDE.md`'s "never claim hardware verification from mocks," do not
-treat this project as ready for a real meeting until that returns.
+(`tests/test_transport_gateway_orchestration.py`). Real-hardware
+verification (`GATEWAY-E2E-001`) is **in progress with a genuine,
+unresolved finding**: two attempts both got real `transcription.partial`
+events (real Silero VAD, real faster-whisper, correct stable-prefix
+promotion) over the real live gateway -- proving the partial-decode path
+works end to end on real hardware -- but `utterance.final` never arrived
+either time. Attempt 1's cause was a test-script gap (fixed). Attempt 2,
+with that fixed, still timed out: the server log shows no further
+activity of any kind (no error, no traceback) after the last partial for
+over two minutes, consistent with the background finalize task (a real
+full-utterance decode competing for GPU with vLLM's ~76 of 81.5 GiB used)
+stalling rather than crashing -- not yet root-caused. `GATEWAY-E2E-002`
+(a live `py-spy dump` of the server process while stalled) is staged and
+`WAITING_FOR_USER` in `MANUAL_ACTIONS.md`; `GATEWAY-E2E-001` is on hold
+pending that diagnosis. Per `CLAUDE.md`'s "never claim hardware
+verification from mocks," do not treat this project as ready for a real
+meeting until this resolves.
 
-Two things remain open after `GATEWAY-E2E-001`, neither to be started
-without the user's explicit direction: the measured translation p95
-latency miss (`LATENCY-001`, ~2.4s vs a documented <1.2s objective,
-plausibly from `--enforce-eager`) and the `translation_queue_depth` Gauge
-cross-session limitation -- both pre-existing, separately documented, and
-untouched by this change. Take a local snapshot first
-(`python scripts/local_backup.py --label <name>`) -- as the very first
-action, before any reading/research -- before starting whichever the user
-chooses next.
+Two more things remain open after `GATEWAY-E2E-001`/`002` resolve,
+neither to be started without the user's explicit direction: the
+measured translation p95 latency miss (`LATENCY-001`, ~2.4s vs a
+documented <1.2s objective, plausibly from `--enforce-eager`) and the
+`translation_queue_depth` Gauge cross-session limitation -- both
+pre-existing, separately documented, and untouched by this change (though
+the same GPU-contention pressure behind the latency finding is a
+plausible, unconfirmed contributing factor to the new stall too). Take a
+local snapshot first (`python scripts/local_backup.py --label <name>`) --
+as the very first action, before any reading/research -- before starting
+whichever the user chooses next.
 
 ---
 

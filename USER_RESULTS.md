@@ -1109,6 +1109,53 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   attempt. Retry sends periodic `AudioFlags.KEEPALIVE` frames while
   waiting for the final event, matching real client behavior.
 
+### GATEWAY-E2E-001 (attempt 2, keepalive retry)
+
+- Date: 2026-08-15
+- Environment: GPU server, `.venv-asr`, real server on `127.0.0.1:3000`.
+- Command summary: same as attempt 1, with the corrected client script
+  (sends `AudioFlags.KEEPALIVE` frames every 3s while waiting for
+  `utterance.final`).
+- Exit status: server startup clean. Client ran its full receive loop (60
+  iterations x 3s = up to 180s) and printed `TIMED OUT waiting for
+  utterance.final` -- it exited normally, not via exception this time.
+- Result: Real partials again (identical content to attempt 1: three
+  `transcription.partial` events, same stable-prefix promotion pattern),
+  but no `utterance.final`, no `error` event, and -- critically -- the
+  server log shows **no further activity of any kind** after the 3rd
+  partial's `faster_whisper Processing audio with duration 00:00.900`
+  line, for the full ~2m33s until the client's own loop gave up and
+  closed the connection (`client disconnected` logged at that point).
+- Relevant output summary (full `gateway_e2e_server.log`):
+  ```
+  INFO:     connection open
+  INFO:     127.0.0.1:48938 - "WebSocket /ws/stream" [accepted]
+  2026-08-15 12:19:48,047 INFO httpx HTTP Request: GET https://huggingface.co/api/models/Systran/faster-whisper-large-v3/revision/main "HTTP/1.1 200 OK"
+  2026-08-15 12:19:50,397 INFO faster_whisper Processing audio with duration 00:00.520
+  2026-08-15 12:19:50,706 INFO faster_whisper Processing audio with duration 00:00.900
+  2026-08-15 12:19:50,792 INFO faster_whisper Processing audio with duration 00:00.900
+  2026-08-15 12:22:24,031 INFO server.transport.gateway client disconnected.
+  ```
+- Redacted raw output file, if any: none.
+- Follow-up: **Not yet root-caused -- this needs a live diagnostic, not
+  further guessing.** Reasoning so far: keepalive frames correctly
+  produce no ASR activity (`_handle_packet` returns early for
+  `AudioFlags.KEEPALIVE`, by design), so their silence in the log is
+  expected, not evidence of a hang by itself. But the *complete absence*
+  of a 4th "Processing audio" line -- which `FinalTranscriber.finalize()`
+  would trigger unconditionally once hard-silence finalization spawns
+  the background finalize task, regardless of whether the resulting text
+  changes -- combined with zero error events and zero tracebacks, is
+  consistent with that background task (a real faster-whisper GPU decode
+  of the full buffered utterance) hanging rather than crashing. The
+  server eventually detected the client disconnect, so the event loop
+  itself was not fully wedged -- this looks like an isolated stall
+  specific to this session's finalize path, plausibly related to GPU
+  contention with the already-running vLLM server (~76 of 81.5 GiB VRAM
+  in use). `GATEWAY-E2E-002` (see `MANUAL_ACTIONS.md`) captures a
+  `py-spy dump` of the live server process while it's in this stalled
+  state to see exactly where it's stuck, rather than guessing further.
+
 ## Result template
 
 ```markdown
