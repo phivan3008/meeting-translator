@@ -83,6 +83,13 @@ class Settings(BaseSettings):
     # --- Infrastructure ------------------------------------------------------
     redis_url: str = "redis://localhost:6379/0"
 
+    # --- Audio baseline --------------------------------------------------------
+    # Fixed wire-format audio frame duration (the client always sends
+    # exactly this per binary packet -- see client/audio/types.py's
+    # FRAME_DURATION_MS). Drives UtteranceOrchestrator/UtteranceSegmenter's
+    # internal per-stream audio-timeline clock.
+    audio_frame_ms: int = Field(default=20, ge=1)
+
     # --- VAD baseline --------------------------------------------------------
     vad_threshold: float = Field(default=0.50, ge=0.0, le=1.0)
     vad_speech_start_ms: int = Field(default=160, ge=0)

@@ -8,11 +8,19 @@ involved.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 
 from server.app import create_app
+from server.asr.fake import ScriptedAsrModel
+from server.asr.interface import AsrModel
+from server.asr.types import TranscriptionResult
+from server.translation.fake import ScriptedTranslationClient
+from server.translation.interface import TranslationClient
+from server.vad.fake import ScriptedVadModel
+from server.vad.interface import VadModel
 from shared.protocol.binary import AudioFlags, AudioFrameHeader, encode_packet
 from shared.protocol.enums import PROTOCOL_VERSION, ErrorCode, EventType, Language, StreamSource
 from shared.protocol.messages import SessionStart, StreamConfig
@@ -28,8 +36,31 @@ def _settings() -> Settings:
     )
 
 
-def _client() -> TestClient:
-    return TestClient(create_app(_settings()))
+def _client(
+    *,
+    asr_model: AsrModel | None = None,
+    translation_client: TranslationClient | None = None,
+    vad_model_factory: Callable[[], VadModel] | None = None,
+) -> TestClient:
+    """Build a test client with inert model doubles by default.
+
+    A probability of 0.0 never crosses the default VAD threshold (0.5), so
+    the segmenter never leaves IDLE and ASR/translation are never invoked
+    -- these tests exercise pure transport concerns (acks, jitter, rate
+    limits, errors), not the orchestration wiring itself (see
+    tests/test_transport_gateway_orchestration.py for that).
+    """
+    return TestClient(
+        create_app(
+            _settings(),
+            asr_model=asr_model
+            or ScriptedAsrModel(
+                [TranscriptionResult(text="unused", language=Language.JAPANESE, duration_ms=0)]
+            ),
+            translation_client=translation_client or ScriptedTranslationClient(["unused"]),
+            vad_model_factory=vad_model_factory or (lambda: ScriptedVadModel([0.0])),
+        )
+    )
 
 
 def _session_start() -> SessionStart:

@@ -16,9 +16,14 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from server.app import create_app
+from server.asr.fake import ScriptedAsrModel
+from server.asr.types import TranscriptionResult
+from server.translation.fake import ScriptedTranslationClient
+from server.vad.fake import ScriptedVadModel
 from shared.protocol.binary import encode_packet
 from shared.protocol.enums import ErrorCode, Language, StreamSource
 from shared.protocol.messages import SessionStart, StreamConfig
@@ -26,6 +31,23 @@ from shared.settings import Settings
 
 ISSUER = "meeting-translator"
 AUDIENCE = "meeting-translator-client"
+
+
+def _create_test_app(settings: Settings) -> FastAPI:
+    """``create_app`` with inert ASR/translation/VAD doubles.
+
+    Probability 0.0 never crosses the default VAD threshold, so these
+    JWT-wiring tests never actually invoke ASR/translation and stay
+    CPU-only (no torch/faster-whisper import).
+    """
+    return create_app(
+        settings,
+        asr_model=ScriptedAsrModel(
+            [TranscriptionResult(text="unused", language=Language.JAPANESE, duration_ms=0)]
+        ),
+        translation_client=ScriptedTranslationClient(["unused"]),
+        vad_model_factory=lambda: ScriptedVadModel([0.0]),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -81,7 +103,7 @@ def test_jwt_authenticator_rejects_connection_without_token(
         # override that and require a real token regardless.
         app_env="development",
     )
-    client = TestClient(create_app(settings))
+    client = TestClient(_create_test_app(settings))
 
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_text(_session_start().model_dump_json())
@@ -102,7 +124,7 @@ def test_jwt_authenticator_accepts_valid_token(tmp_path: Path, keypair: tuple[st
         ws_ack_every_packets=1,  # ack deterministically after one packet
         ws_ack_every_ms=999_999,
     )
-    client = TestClient(create_app(settings))
+    client = TestClient(_create_test_app(settings))
 
     now = time.time()
     token = jwt.encode(
@@ -146,7 +168,7 @@ def test_no_jwt_key_configured_uses_dev_authenticator_and_allows_anonymous() -> 
         ws_ack_every_packets=1,
         ws_ack_every_ms=999_999,
     )
-    client = TestClient(create_app(settings))
+    client = TestClient(_create_test_app(settings))
 
     with client.websocket_connect("/ws/stream") as ws:
         ws.send_text(_session_start().model_dump_json())

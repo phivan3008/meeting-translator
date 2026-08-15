@@ -7,7 +7,11 @@ from datetime import UTC, datetime
 from fastapi.testclient import TestClient
 
 from server.app import create_app
+from server.asr.fake import ScriptedAsrModel
+from server.asr.types import TranscriptionResult
 from server.observability.metrics import create_metrics
+from server.translation.fake import ScriptedTranslationClient
+from server.vad.fake import ScriptedVadModel
 from shared.protocol.binary import encode_packet
 from shared.protocol.enums import Language, StreamSource
 from shared.protocol.messages import SessionStart, StreamConfig
@@ -34,7 +38,17 @@ def test_metrics_endpoint_exposes_prometheus_text_format() -> None:
 def test_metrics_endpoint_reflects_gateway_activity() -> None:
     metrics = create_metrics()
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
-    client = TestClient(create_app(settings, metrics=metrics))
+    client = TestClient(
+        create_app(
+            settings,
+            metrics=metrics,
+            asr_model=ScriptedAsrModel(
+                [TranscriptionResult(text="unused", language=Language.JAPANESE, duration_ms=0)]
+            ),
+            translation_client=ScriptedTranslationClient(["unused"]),
+            vad_model_factory=lambda: ScriptedVadModel([0.0]),
+        )
+    )
 
     session_start = SessionStart(
         session_id="sess-metrics-1",

@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,9 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Response, status
 
+from server.asr.interface import AsrModel
+from server.asr.types import AsrConfig
+from server.asr.whisper import WhisperAsrModel
 from server.observability.correlation import CorrelationFilter
 from server.observability.metrics import (
     CONTENT_TYPE_LATEST,
@@ -26,10 +30,19 @@ from server.observability.metrics import (
     create_metrics,
     render_metrics,
 )
+from server.orchestration.heuristics import HeuristicConfig
+from server.orchestration.types import CompletenessConfig
+from server.reliability.circuit_breaker import CircuitBreaker
 from server.reliability.shutdown import ShutdownCoordinator
+from server.translation.client import VllmTranslationClient
+from server.translation.interface import TranslationClient
+from server.translation.types import TranslationConfig
 from server.transport.auth import Authenticator, JwtAuthenticator, StaticTokenAuthenticator
-from server.transport.gateway import create_gateway_router
+from server.transport.gateway import OrchestrationDeps, create_gateway_router
 from server.transport.session import SessionManager
+from server.vad.interface import VadModel
+from server.vad.silero import SileroVadModel
+from server.vad.types import VadConfig
 from shared.logging import configure_logging
 from shared.settings import Settings, get_settings
 from shared.version import __version__
@@ -89,8 +102,24 @@ def create_app(
     settings: Settings | None = None,
     *,
     metrics: Metrics | None = None,
+    asr_model: AsrModel | None = None,
+    translation_client: TranslationClient | None = None,
+    vad_model_factory: Callable[[], VadModel] | None = None,
+    asr_circuit_breaker: CircuitBreaker | None = None,
+    translation_circuit_breaker: CircuitBreaker | None = None,
 ) -> FastAPI:
-    """Create and configure the FastAPI application."""
+    """Create and configure the FastAPI application.
+
+    ``asr_model``/``translation_client``/``vad_model_factory``/circuit
+    breakers default to the real adapters (``WhisperAsrModel``,
+    ``VllmTranslationClient``, ``SileroVadModel``) so a normally-started
+    server actually transcribes and translates; tests inject scripted
+    doubles instead so the CPU suite never downloads weights or needs a
+    GPU. ``asr_model``/``translation_client`` are shared across every
+    session (safe: see ``server/transport/gateway.py``'s
+    ``OrchestrationDeps`` docstring); ``vad_model_factory`` builds one
+    fresh, non-shared model per stream.
+    """
     resolved = settings or get_settings()
     configure_logging(resolved.log_level)
     root_logger = logging.getLogger()
@@ -109,6 +138,47 @@ def create_app(
         max_sessions=resolved.ws_max_sessions,
     )
     shutdown.set_active_count_source(lambda: session_manager.active_count)
+
+    owns_translation_client = translation_client is None
+    resolved_asr_model: AsrModel = asr_model or WhisperAsrModel(AsrConfig.from_settings(resolved))
+    resolved_translation_client: TranslationClient = translation_client or VllmTranslationClient(
+        TranslationConfig.from_settings(resolved)
+    )
+    resolved_vad_model_factory: Callable[[], VadModel] = vad_model_factory or SileroVadModel
+    resolved_asr_circuit_breaker = asr_circuit_breaker or CircuitBreaker(
+        failure_threshold=resolved.circuit_breaker_failure_threshold,
+        reset_timeout_ms=resolved.circuit_breaker_reset_timeout_ms,
+    )
+    resolved_translation_circuit_breaker = translation_circuit_breaker or CircuitBreaker(
+        failure_threshold=resolved.circuit_breaker_failure_threshold,
+        reset_timeout_ms=resolved.circuit_breaker_reset_timeout_ms,
+    )
+    # Small shared pool for VAD probability() calls (must never block the
+    # event loop, per VadModel's own contract) -- deliberately not one
+    # executor per session/stream, which would grow unbounded with
+    # ws_max_sessions; VAD calls are cheap (ms-scale CPU), so a small
+    # shared pool gives good cross-session latency without unbounded
+    # thread growth.
+    vad_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="vad")
+
+    orchestration = OrchestrationDeps(
+        asr_model=resolved_asr_model,
+        asr_config=AsrConfig.from_settings(resolved),
+        translation_client=resolved_translation_client,
+        translation_config=TranslationConfig.from_settings(resolved),
+        vad_config=VadConfig.from_settings(resolved),
+        heuristic_config=HeuristicConfig.from_settings(resolved),
+        completeness_config=CompletenessConfig.from_settings(resolved),
+        vad_model_factory=resolved_vad_model_factory,
+        vad_executor=vad_executor,
+        asr_circuit_breaker=resolved_asr_circuit_breaker,
+        translation_circuit_breaker=resolved_translation_circuit_breaker,
+        frame_ms=resolved.audio_frame_ms,
+        partial_interval_ms=resolved.whisper_partial_interval_ms,
+        partial_overlap_ms=resolved.whisper_audio_overlap_ms,
+        asr_final_timeout_ms=resolved.asr_final_timeout_ms,
+        translation_queue_capacity_per_priority=resolved.translation_queue_capacity_per_priority,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -130,18 +200,33 @@ def create_app(
                 "shutdown drain timed out with %d session(s) still active",
                 shutdown.active_count(),
             )
+        vad_executor.shutdown(wait=False)
+        if owns_translation_client:
+            # Only close a client this app itself constructed -- an
+            # injected client (tests, or a caller reusing it elsewhere)
+            # is never closed out from under its owner, mirroring
+            # VllmTranslationClient's own _owns_client rule one level up.
+            aclose = getattr(resolved_translation_client, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     app = FastAPI(title="Meeting Translator Server", version=__version__, lifespan=lifespan)
     app.state.settings = resolved
     app.state.metrics = resolved_metrics
     app.state.shutdown = shutdown
     app.state.session_manager = session_manager
+    app.state.asr_model = resolved_asr_model
+    app.state.translation_client = resolved_translation_client
+    app.state.vad_executor = vad_executor
+    app.state.asr_circuit_breaker = resolved_asr_circuit_breaker
+    app.state.translation_circuit_breaker = resolved_translation_circuit_breaker
 
     app.include_router(
         create_gateway_router(
             settings=resolved,
             authenticator=authenticator,
             session_manager=session_manager,
+            orchestration=orchestration,
             metrics=resolved_metrics,
             shutdown=shutdown,
         )
