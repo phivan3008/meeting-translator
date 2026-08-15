@@ -13,7 +13,28 @@ verification from mocks".
 
 ### Action ID: GATEWAY-E2E-001
 
-- Status: WAITING_FOR_USER
+- Status: WAITING_FOR_USER (attempt 1: real, meaningful partial success --
+  see below; this is the corrected retry)
+- Attempt 1 result (2026-08-15): Real success -- three real
+  `transcription.partial` events arrived with real content from real
+  Silero VAD + real faster-whisper over the real live gateway (the exact
+  known Whisper hallucination on synthetic-tone input already seen in
+  `GPU-E2E-001`/`GPU-E2E-003`, with the stable-prefix promotion logic
+  visibly correct across revisions). No `utterance.final` arrived --the
+  connection was closed by the *server's own idle timeout* (WS close
+  code 1008) while real final ASR + real translation were still running
+  as a background task. Root cause: the test client stopped sending
+  anything after its test frames and just waited for a reply, unlike a
+  real client (`AudioSender`), which never stops streaming
+  frames/keepalives -- so the server had nothing to reset its idle timer
+  with while the background finalize work was in flight. This is a test
+  -script fidelity gap, not a wiring defect; see
+  `USER_RESULTS.md`'s `GATEWAY-E2E-001 (attempt 1)` for full detail.
+  Fixed below: the client now sends periodic `AudioFlags.KEEPALIVE`
+  frames while waiting for the final event, matching real client
+  behavior. Also note: port 8080 was already in use on this host last
+  time (unrelated process) -- the commands below default to 3000
+  instead; adjust if that's also taken.
 - Purpose: `UtteranceOrchestrator` is now wired into
   `server/transport/gateway.py`, proven with scripted ASR/translation/VAD
   doubles over the real websocket transport
@@ -56,18 +77,25 @@ verification from mocks".
   ```bash
   cd /workspace/meeting-translator   # adjust to the real path on this host -- verify with pwd/ls
   source .venv-asr/bin/activate
+  # silero-vad/uvicorn/websockets are already installed from attempt 1;
+  # re-running these is harmless if not.
   pip install "silero-vad>=5,<6"
   pip install "uvicorn[standard]>=0.29,<1" "websockets>=12,<13"
 
   # 1. Start the real server in the background, keeping its log.
-  nohup uvicorn server.app:app --host 127.0.0.1 --port 8080 > gateway_e2e_server.log 2>&1 &
+  #    Port 8080 was busy last time (unrelated process) -- using 3000;
+  #    adjust if that's taken too (check with `ss -ltn` or similar).
+  nohup uvicorn server.app:app --host 127.0.0.1 --port 3000 > gateway_e2e_server.log 2>&1 &
   disown
   sleep 5
-  curl -s http://127.0.0.1:8080/health/live
+  curl -s http://127.0.0.1:3000/health/live
   tail -n 40 gateway_e2e_server.log   # confirm clean startup, no traceback
 
   # 2. Real WebSocket client: real protocol packets, a synthesized sine
-  #    tone (no personal/bundled audio), real events read back.
+  #    tone (no personal/bundled audio), real events read back. Sends
+  #    periodic KEEPALIVE frames while waiting for utterance.final --
+  #    matching real client behavior -- so the server's idle timeout
+  #    doesn't fire while real final ASR/translation are still running.
   cat > /tmp/gateway_e2e_client.py << 'EOF'
   import asyncio
   import json
@@ -77,7 +105,7 @@ verification from mocks".
 
   import websockets
 
-  from shared.protocol.binary import encode_packet
+  from shared.protocol.binary import AudioFlags, encode_packet
   from shared.protocol.enums import Language, StreamSource
   from shared.protocol.messages import SessionStart, StreamConfig
 
@@ -98,7 +126,7 @@ verification from mocks".
 
   async def main() -> None:
       session_start = SessionStart(
-          session_id="sess-gateway-e2e-001",
+          session_id="sess-gateway-e2e-001b",
           client_id="gateway-e2e-client",
           timestamp=datetime.now(UTC),
           streams=[
@@ -111,7 +139,7 @@ verification from mocks".
               )
           ],
       )
-      async with websockets.connect("ws://127.0.0.1:8080/ws/stream") as ws:
+      async with websockets.connect("ws://127.0.0.1:3000/ws/stream") as ws:
           await ws.send(session_start.model_dump_json())
 
           seq = 0
@@ -132,13 +160,31 @@ verification from mocks".
               await ws.send(packet)
               seq += 1
 
-          for _ in range(200):
-              raw = await asyncio.wait_for(ws.recv(), timeout=30)
+          final_seen = False
+          for _ in range(60):
+              try:
+                  raw = await asyncio.wait_for(ws.recv(), timeout=3)
+              except asyncio.TimeoutError:
+                  # Nothing arrived in 3s -- send a keepalive so the
+                  # server's idle timer doesn't fire while real final
+                  # ASR/translation are still running in the background.
+                  seq += 1
+                  await ws.send(
+                      encode_packet(
+                          stream_number=1, sequence_number=seq,
+                          client_timestamp_ms=seq * FRAME_MS, payload=b"",
+                          flags=AudioFlags.KEEPALIVE,
+                      )
+                  )
+                  continue
               event = json.loads(raw)
               if event["type"] in ("transcription.partial", "utterance.final", "error"):
                   print(f"{event['type']}: {event}")
               if event["type"] == "utterance.final":
+                  final_seen = True
                   break
+          if not final_seen:
+              print("TIMED OUT waiting for utterance.final")
 
   asyncio.run(main())
   EOF

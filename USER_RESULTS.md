@@ -1057,6 +1057,58 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   upstream (to re-enable `torch.compile`) before treating this project as
   production-ready for translation latency.
 
+### GATEWAY-E2E-001 (attempt 1)
+
+- Date: 2026-08-15
+- Environment: GPU server, `.venv-asr`, real server run on `127.0.0.1:3000`
+  (port 8080 was already in use by another process on this host, so the
+  action's default port was swapped -- noted for the record, not a
+  problem).
+- Command summary: `pip install "silero-vad>=5,<6"`, `pip install
+  "uvicorn[standard]>=0.29,<1" "websockets>=12,<13"`, real `uvicorn
+  server.app:app` launch, then `/tmp/gateway_e2e_client.py` (real
+  `websockets.connect` client sending a synthesized sine tone over the
+  real protocol).
+- Exit status: installs and server startup clean, no traceback. Client
+  script raised `websockets.exceptions.ConnectionClosedError: received
+  1008 (policy violation)` partway through.
+- Result: PARTIAL SUCCESS -- real, meaningful evidence the wiring works,
+  but the full exchange (through `utterance.final`) did not complete.
+- Relevant output summary:
+  - `/health/live` returned `{"status":"alive","app_env":"development"}`.
+  - Three real `transcription.partial` events arrived with real content:
+    `unstable_text: 'ご視聴ありがとうございました。'` (revision 1),
+    `'ご視聴ありがとうございました'` (revision 2), then promoted to
+    `stable_text: 'ご視聴ありがとうございました'` with empty
+    `unstable_text` (revision 3) -- the exact same known
+    faster-whisper/Whisper hallucination on non-speech synthetic-tone
+    input already seen in `GPU-E2E-001`/`GPU-E2E-003`, and the
+    stable-prefix promotion logic visibly working correctly on a real
+    decode.
+  - No `utterance.final` arrived. The client's `ws.recv()` (30s
+    client-side timeout, never reached) instead raised
+    `ConnectionClosedError` -- the *server* closed the connection first,
+    with close code 1008 (policy violation), which `gateway.py` only
+    sends for its idle-timeout path (`_CLOSE_POLICY_VIOLATION`).
+- Redacted raw output file, if any: none.
+- Follow-up: Root cause is the test script, not the wiring. Real clients
+  (`AudioSender`) never stop sending frames/keepalives while connected;
+  this script sent its test frames then simply waited for a reply,
+  giving the server nothing to reset its idle timer with. Once the last
+  silence frame triggered hard-silence finalization, that work runs as a
+  background task (`UtteranceOrchestrator._spawn`) -- `_handle_packet`
+  returns immediately without waiting for it, so the ingest loop went
+  back to idly waiting on `websocket.receive()` while real final ASR +
+  real translation were still in flight. The server's idle timeout
+  elapsed before that background work published `utterance.final`,
+  closing the connection out from under it. This is a genuine
+  test-fidelity gap (a real client never triggers this), not a wiring
+  defect -- the three real partials prove the actual wiring path (real
+  VAD -> real ASR -> stable-prefix -> published event -> real websocket)
+  works correctly end to end; only the final leg wasn't observed this
+  attempt. Retry sends periodic `AudioFlags.KEEPALIVE` frames while
+  waiting for the final event, matching real client behavior.
+
 ## Result template
 
 ```markdown
