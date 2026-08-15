@@ -2,8 +2,11 @@
 
 ## Current phase
 
-Phase 11: End-to-end tests and Windows packaging. This is the last
-phase-by-phase prompt in `prompts/phases/` -- see "Next action" for what
+Phase 11 (end-to-end tests and Windows packaging) is complete -- the last
+phase-by-phase prompt in `prompts/phases/`. Since then, at the user's
+explicit direction (not a numbered phase from `prompts/phases/`, since
+none exists for this), `UtteranceOrchestrator` has been wired into the
+live gateway (2026-08-15) -- see "Next action" for detail and for what
 that does and does not mean.
 
 ## Verification state
@@ -26,10 +29,11 @@ that does and does not mean.
   measured percentiles (against fake backends locally, as documented in
   its own docstring). None of this is GPU or Windows-audio-hardware
   verification -- see "Phase 11 deliverables" and "Known limitations" for
-  exactly what remains staged as a manual action (`MANUAL_ACTIONS.md`) and
-  what "the one gap that matters most" is
-  (`docs/FINAL_IMPLEMENTATION_REPORT.md`: `UtteranceOrchestrator` is still
-  not wired into the live gateway).
+  exactly what remains staged as a manual action (`MANUAL_ACTIONS.md`).
+  "The one gap that matters most" from this phase --
+  `UtteranceOrchestrator` not being wired into the live gateway -- has
+  since been closed at the LOCAL_VERIFIED level; see "Next action" and
+  `docs/FINAL_IMPLEMENTATION_REPORT.md`'s updated opening section.
 - Phase 10 verification: **LOCAL_VERIFIED only.** Everything built this
   phase (JWT auth, circuit breaker, graceful shutdown, correlation ids,
   Prometheus metrics, session cap, readiness dependency check, redaction
@@ -1875,7 +1879,9 @@ section covers what was built and how it was verified.
     `UtteranceOrchestrator` is still not wired into the live gateway. See
     `docs/FINAL_IMPLEMENTATION_REPORT.md`'s opening section -- this is the
     single most important thing to read before assuming this project is
-    ready for a real meeting.
+    ready for a real meeting. **Update (2026-08-15): this gap has since
+    been closed at the LOCAL_VERIFIED level** -- see the dedicated bullet
+    at the end of this list and "Next action" below.
   - The `translation_queue_depth` Gauge cross-session-sharing limitation
     (found by this phase's own load test) is newly documented, not fixed
     -- see "Phase 11 deliverables"'s last bullet.
@@ -1924,7 +1930,122 @@ section covers what was built and how it was verified.
     own -- unchanged since Phase 04; segmentation *logic* is fully
     verified with scripted probabilities.
 
+- **Post-Phase-11 (2026-08-15): `UtteranceOrchestrator` wired into the
+  live gateway**, at the user's explicit direction (not a numbered phase
+  from `prompts/phases/`, since none exists for this work). Pure
+  composition, no changes to `UtteranceOrchestrator`,
+  `SessionManager`/`Session`, protocol messages, or the
+  `VadModel`/`AsrModel`/`TranslationClient` interfaces/adapters/fakes.
+  `server/transport/gateway.py` gained `OrchestrationDeps` (bundling a
+  shared ASR model, shared translation client, shared ASR/translation
+  `CircuitBreaker`s, and a per-stream `VadModel` factory -- Silero holds
+  real recurrent state and must never be shared across streams) and
+  `_build_orchestrator`/`_flush_all_streams` helpers; released frames are
+  now fed through VAD (offloaded to a small shared executor, never
+  blocking the event loop) -> `ingest_frame` -> `run_due_partial_decodes`,
+  and the orchestrator's published events are sent back over the socket
+  as protocol JSON. `server/app.py`'s `create_app` gained injectable
+  `asr_model`/`translation_client`/`vad_model_factory`/circuit-breaker
+  overrides (mirroring the existing `metrics=` pattern) so the CPU suite
+  stays GPU/model-free; the real adapters
+  (`WhisperAsrModel`/`VllmTranslationClient`/`SileroVadModel`) are the
+  defaults for an actually-running server. New `Settings.audio_frame_ms`
+  (default 20) reaches `OrchestrationDeps.frame_ms`.
+  - **A real correctness bug was caught by the new test itself before
+    landing, not found later.** `run_due_partial_decodes(now_ms=...)`
+    must be compared against the same domain
+    `PartialDecodeScheduler.start()` was seeded from --
+    `UtteranceSegmenter.now_ms`, a zero-based clock that advances by
+    exactly `frame_ms` per frame *processed*, not wall-clock time. The
+    first implementation used wall-clock elapsed time since the
+    handshake; this passed a quick mental check ("both are monotonic,
+    both start near zero together") but failed the very first real test
+    run, because that test sends a burst of frames with no real-time
+    pacing -- wall-clock elapsed time stayed near zero throughout, so no
+    partial decode ever became "due" before the utterance finalized on
+    silence. Fixed by tracking a per-connection audio-timeline counter
+    (`audio_now_ms`), advanced by `frame_ms` per frame actually ingested
+    across the session's streams, instead of wall-clock time. In a real
+    deployment (frames arriving roughly every `frame_ms` in real time)
+    the two clocks would have tracked each other closely enough that this
+    bug likely would not have surfaced in casual manual testing -- it
+    took an automated test sending frames at full speed to expose it.
+  - **New test**: `tests/test_transport_gateway_orchestration.py` is the
+    first test proving audio-in -> caption-out over the real live
+    websocket transport (scripted ASR/translation/VAD doubles, no
+    GPU/model weights). All 9 existing `tests/test_transport_gateway.py`
+    tests, plus `tests/test_app_jwt_wiring.py`/
+    `tests/test_app_metrics_endpoint.py`'s websocket-opening cases,
+    needed inert model doubles injected (VAD probability `0.0` never
+    crosses the default threshold, so ASR/translation are never invoked
+    and those tests' own assertions are unaffected) -- caught by actually
+    running the full suite, not assumed safe.
+  - **Local check results**: `ruff format --check .` (180 files),
+    `ruff check .` (clean), `mypy client server shared` (78 source files,
+    clean), `pytest -q -m "not gpu and not windows_audio"` (422 passed, 3
+    deselected -- 421 prior + 1 new).
+  - **Housekeeping found and fixed while committing this work**: this
+    repository had no `.gitignore`, so 224 build-artifact files
+    (`__pycache__`/`*.pyc`, `meeting_translator.egg-info/`) were
+    accidentally tracked in git -- the same class of problem that had
+    already caused one prior accidental-commit-and-manual-delete cycle
+    for `.venv/` earlier in this project's git history. Added
+    `.gitignore` and untracked them (files remain on disk) in a separate
+    commit before the wiring change itself, so the wiring diff stayed
+    clean and reviewable.
+  - **What is NOT yet true**: this wiring is LOCAL_VERIFIED with scripted
+    doubles only. Real Silero VAD + real faster-whisper + real vLLM,
+    driven through the actual live gateway with a real connected client,
+    has not been confirmed -- staged as `GATEWAY-E2E-001` in
+    `MANUAL_ACTIONS.md`, `WAITING_FOR_USER`. The separately-known
+    `translation_queue_depth` Gauge cross-session limitation and the
+    `--enforce-eager` translation-latency finding (`LATENCY-001`,
+    translation p95 ~2.4s vs a <1.2s objective) are both unrelated,
+    pre-existing, and explicitly out of scope for this change -- not
+    touched. UI acceptance criteria about partial/final/translation
+    *rendering* still remain LOCAL_VERIFIED only, not screen-verified
+    with real data -- `GATEWAY-E2E-001`'s real-hardware run is what would
+    finally let a real session drive that UI with real events.
+
 ## Next action
+
+**`UtteranceOrchestrator` is now wired into the live gateway
+(2026-08-15): LOCAL_VERIFIED**, at the user's explicit direction after
+Phase 11 completed (not a numbered phase from `prompts/phases/`). See the
+dedicated "Post-Phase-11" bullet under "Known limitations" above for full
+detail: `server/transport/gateway.py`/`server/app.py` now build a real
+per-session orchestrator (shared ASR model/translation client/circuit
+breakers, per-stream VAD models) and drive it from released audio frames,
+publishing its events back over the socket. A real correctness bug (the
+`now_ms` clock domain mismatch) was caught by the new test itself before
+landing, not found later. All local checks pass: `ruff format --check .`,
+`ruff check .`, `mypy client server shared` clean; `pytest -q -m "not gpu
+and not windows_audio"` 422 passed, 3 deselected. Committed and pushed to
+`origin/master` in two commits (a `.gitignore`/untrack-build-artifacts
+housekeeping fix, found while preparing to commit this work, then the
+wiring change itself).
+
+**What this does and does not mean**: the wiring itself -- the code path
+from audio-in to caption-out over the real live websocket -- is now real
+and proven, with scripted ASR/translation/VAD doubles on CPU
+(`tests/test_transport_gateway_orchestration.py`). It has **not** been
+proven with real Silero VAD + real faster-whisper + real vLLM through the
+actual gateway, talking to a real connected client. That is staged as
+`GATEWAY-E2E-001` in `MANUAL_ACTIONS.md`, `WAITING_FOR_USER` --
+per `CLAUDE.md`'s "never claim hardware verification from mocks," do not
+treat this project as ready for a real meeting until that returns.
+
+Two things remain open after `GATEWAY-E2E-001`, neither to be started
+without the user's explicit direction: the measured translation p95
+latency miss (`LATENCY-001`, ~2.4s vs a documented <1.2s objective,
+plausibly from `--enforce-eager`) and the `translation_queue_depth` Gauge
+cross-session limitation -- both pre-existing, separately documented, and
+untouched by this change. Take a local snapshot first
+(`python scripts/local_backup.py --label <name>`) -- as the very first
+action, before any reading/research -- before starting whichever the user
+chooses next.
+
+---
 
 **Phase 11 (end-to-end tests and Windows packaging) is complete:
 LOCAL_VERIFIED**, per `prompts/phases/11_E2E_PACKAGING.md`'s required

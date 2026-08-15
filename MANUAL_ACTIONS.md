@@ -4,18 +4,171 @@ Claude ghi các thao tác mà người dùng cần thực hiện tại đây.
 
 ## Pending actions
 
-None. All manual actions staged so far -- including the full three
-originally staged by Phase 11 (`WINDOWS-PACKAGE-001`, the `GPU-E2E-*`
-series, and `LATENCY-001`) plus the `GPU-TRANSLATE-008` rebuild and its
-diagnostics -- have PASSED. See "Completed actions" below. Real hardware
-latency numbers now exist for the first time in this project
-(`LATENCY-001`), with one genuine finding: measured translation p95
-(2392.1ms) exceeds `docs/PRODUCT_REQUIREMENTS.md`'s <1.2s objective,
-plausibly due to `--enforce-eager` (required to work around the
-`flashinfer` bug) disabling `torch.compile`/CUDA graphs -- not yet
-root-caused with certainty. No further manual action is currently
-`WAITING_FOR_USER`; do not begin new GPU-server work without the user's
-explicit direction, per the standing instruction.
+One new action, `GATEWAY-E2E-001`, staged after `UtteranceOrchestrator`
+was wired into the live gateway (2026-08-15, at the user's direction).
+Not required to close out that work's own local scope (it is already
+LOCAL_VERIFIED with scripted doubles) -- this is the real-hardware
+acceptance test for it, per `CLAUDE.md`'s "never claim hardware
+verification from mocks".
+
+### Action ID: GATEWAY-E2E-001
+
+- Status: WAITING_FOR_USER
+- Purpose: `UtteranceOrchestrator` is now wired into
+  `server/transport/gateway.py`, proven with scripted ASR/translation/VAD
+  doubles over the real websocket transport
+  (`tests/test_transport_gateway_orchestration.py`). This action is the
+  first check with **real** Silero VAD + real faster-whisper + real vLLM,
+  driven through the **actual live gateway** by a **real WebSocket
+  client** -- not `tests/test_e2e_gpu.py`, which calls
+  `UtteranceOrchestrator` directly and bypasses the gateway entirely.
+  Confirms real audio-in actually produces real
+  `transcription.partial`/`utterance.final` events over the wire.
+- Run on: The ASR GPU host (`WhisperAsrModel`/`SileroVadModel` run
+  in-process inside the server, not as a remote service, so the server
+  itself must run where `faster-whisper` and GPU access are available --
+  same host as `GPU-E2E-003`/`LATENCY-001`), with network reachability to
+  the running vLLM server from `GPU-TRANSLATE-008` (confirmed healthy in
+  `GPU-E2E-003`).
+- Prerequisites: `.venv-asr` (already has `faster-whisper`, `dev` extra).
+  Additionally needs:
+  - `pip install "silero-vad>=5,<6"` (real VAD -- pulls in `torch`, not
+    otherwise present in this venv per `GPU-ASR-002`'s finding).
+  - `pip install "uvicorn[standard]>=0.29,<1" "websockets>=12,<13"` (to
+    run the real server and to drive a WebSocket client against it --
+    neither is in the `dev` extra, only `server`; installing just these
+    two avoids pulling in `redis`, which this test doesn't need).
+  - A `.env` (or exported vars) with `VLLM_BASE_URL` pointing at the
+    running vLLM server (confirm with the same `/health` check
+    `GPU-E2E-002` used first) and `APP_ENV` left as `development` (or
+    unset) so the dev anonymous authenticator applies -- no JWT token
+    needed for this check.
+- Safety notes: Starts a real server process holding a real `large-v3`
+  model in GPU memory (~2.88 GiB, per `GPU-ASR-004`) alongside the
+  already-running vLLM server (~75.9 GiB used of 81.5 GiB total per
+  `GPU-TRANSLATE-008`'s verification) -- headroom is tight (~5.6 GiB
+  free); an OOM here is a real possible outcome and itself useful signal
+  (see `docs/OPERATOR_RUNBOOK_SEED.md`'s "Whisper or vLLM OOM response"),
+  not necessarily a bug. Uses a synthesized sine tone as input, matching
+  `GPU-ASR-004`/`GPU-E2E-001`'s precedent -- no personal or bundled
+  audio. Read-only against vLLM (a few chat-completion requests).
+- Commands:
+  ```bash
+  cd /workspace/meeting-translator   # adjust to the real path on this host -- verify with pwd/ls
+  source .venv-asr/bin/activate
+  pip install "silero-vad>=5,<6"
+  pip install "uvicorn[standard]>=0.29,<1" "websockets>=12,<13"
+
+  # 1. Start the real server in the background, keeping its log.
+  nohup uvicorn server.app:app --host 127.0.0.1 --port 8080 > gateway_e2e_server.log 2>&1 &
+  disown
+  sleep 5
+  curl -s http://127.0.0.1:8080/health/live
+  tail -n 40 gateway_e2e_server.log   # confirm clean startup, no traceback
+
+  # 2. Real WebSocket client: real protocol packets, a synthesized sine
+  #    tone (no personal/bundled audio), real events read back.
+  cat > /tmp/gateway_e2e_client.py << 'EOF'
+  import asyncio
+  import json
+  import math
+  import struct
+  from datetime import UTC, datetime
+
+  import websockets
+
+  from shared.protocol.binary import encode_packet
+  from shared.protocol.enums import Language, StreamSource
+  from shared.protocol.messages import SessionStart, StreamConfig
+
+  FRAME_MS = 20
+  SAMPLE_RATE = 16000
+  FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
+
+  def sine_frame(frame_index: int, frequency_hz: float = 220.0, amplitude: float = 0.2) -> bytes:
+      samples = []
+      for i in range(FRAME_SAMPLES):
+          t = (frame_index * FRAME_SAMPLES + i) / SAMPLE_RATE
+          value = amplitude * math.sin(2 * math.pi * frequency_hz * t)
+          samples.append(int(value * 32767))
+      return struct.pack(f"<{FRAME_SAMPLES}h", *samples)
+
+  def silence_frame() -> bytes:
+      return b"\x00\x00" * FRAME_SAMPLES
+
+  async def main() -> None:
+      session_start = SessionStart(
+          session_id="sess-gateway-e2e-001",
+          client_id="gateway-e2e-client",
+          timestamp=datetime.now(UTC),
+          streams=[
+              StreamConfig(
+                  stream_number=1,
+                  stream_id="mic-01",
+                  source=StreamSource.MICROPHONE,
+                  source_language=Language.JAPANESE,
+                  target_language=Language.VIETNAMESE,
+              )
+          ],
+      )
+      async with websockets.connect("ws://127.0.0.1:8080/ws/stream") as ws:
+          await ws.send(session_start.model_dump_json())
+
+          seq = 0
+          # ~1.5s tone (past min_speech_ms), then enough silence to force
+          # hard-silence finalization deterministically.
+          for i in range(75):
+              packet = encode_packet(
+                  stream_number=1, sequence_number=seq, client_timestamp_ms=seq * FRAME_MS,
+                  payload=sine_frame(i),
+              )
+              await ws.send(packet)
+              seq += 1
+          for _ in range(60):
+              packet = encode_packet(
+                  stream_number=1, sequence_number=seq, client_timestamp_ms=seq * FRAME_MS,
+                  payload=silence_frame(),
+              )
+              await ws.send(packet)
+              seq += 1
+
+          for _ in range(200):
+              raw = await asyncio.wait_for(ws.recv(), timeout=30)
+              event = json.loads(raw)
+              if event["type"] in ("transcription.partial", "utterance.final", "error"):
+                  print(f"{event['type']}: {event}")
+              if event["type"] == "utterance.final":
+                  break
+
+  asyncio.run(main())
+  EOF
+  PYTHONPATH=/workspace/meeting-translator python /tmp/gateway_e2e_client.py
+
+  # 3. Cleanup.
+  pkill -f "uvicorn server.app:app"
+  ```
+- Expected success indicators: Step 1's `/health/live` returns
+  `{"status":"alive",...}` and the log shows a clean uvicorn startup with
+  no traceback. Step 2 prints at least one `transcription.partial` (or
+  goes straight to `utterance.final` -- either is fine, matching
+  `GPU-E2E-001`'s "no partial firing isn't a wiring failure" precedent)
+  and exactly one `utterance.final` with real fields
+  (`transcription`/`translation`/`translation_status`) -- content
+  accuracy on a synthetic tone is not the point (may be empty or a
+  hallucinated phrase, as `GPU-E2E-003` already saw), proving the *wire
+  path* executed for real is. No `error` events. If an OOM or connection
+  error occurs instead, that is itself useful, expected-possible signal
+  -- report it rather than treating it as an action failure.
+  Expected artifacts: `gateway_e2e_server.log`; `/tmp/gateway_e2e_client.py`
+  is temporary.
+- Rollback or cleanup: `pkill -f "uvicorn server.app:app"` if still
+  running; `rm /tmp/gateway_e2e_client.py`.
+- Return to Claude (secrets/hostnames redacted):
+  - `gateway_e2e_server.log`'s startup excerpt.
+  - The full printed event sequence from the client script.
+  - Whether exactly one `utterance.final` arrived, and its
+    `transcription`/`translation`/`translation_status` values.
+  - Any error, OOM, or connection failure observed.
 
 ## Completed actions
 

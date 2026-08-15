@@ -8,24 +8,41 @@ hardware-dependent verification still required"). `IMPLEMENTATION_STATUS.md`
 remains the authoritative, continuously-updated record; this document is a
 snapshot as of Phase 11's completion, cross-referenced against it.
 
-## The one gap that matters most
+## The one gap that mattered most (closed, 2026-08-15 -- local; hardware verification still pending)
 
-**`UtteranceOrchestrator` (VAD -> partial ASR -> final ASR -> translation)
-is not wired into the live `server/transport/gateway.py` WebSocket ingest
-path.** This has been true and explicitly flagged since Phase 08 and
-remains true after Phase 11 -- it was never assigned to any phase's
-required outcomes. The practical consequence: **a real client connected to
-a real running server today will not see live captions.** Every piece the
-pipeline is built from is real, tested, and (for the GPU-hosted pieces)
-separately hardware-verified in isolation -- transport, VAD, ASR,
-translation, the orchestrator, the UI -- but they are not yet connected to
-each other over a live network path. `tests/test_e2e_mocked_pipeline.py`
-(Phase 11) proves the full logical chain works when composed directly, and
-`tests/test_e2e_gpu.py` (Phase 11, `gpu`-marked) proves it against real
-GPU backends the same way -- but neither goes through the WebSocket
-gateway, because the gateway does not yet drive the orchestrator. Closing
-this gap is the natural next phase of work and should be discussed
-explicitly with whoever directs the next phase, not assumed.
+**Update:** `UtteranceOrchestrator` is now wired into the live
+`server/transport/gateway.py` WebSocket ingest path, at the user's
+explicit direction after Phase 11 completed. Each session builds a real
+orchestrator (shared ASR model/translation client/circuit breakers, one
+VAD model per stream), feeds released audio frames through VAD ->
+`ingest_frame` -> `run_due_partial_decodes`, and publishes
+`transcription.partial`/`utterance.final`/`translation.updated` events
+back over the socket; `flush_stream` runs on disconnect. This is
+LOCAL_VERIFIED: `tests/test_transport_gateway_orchestration.py` is the
+first test to prove audio-in -> caption-out over the real live websocket
+transport (not just the orchestrator called directly, which
+`tests/test_e2e_mocked_pipeline.py`/`tests/test_e2e_gpu.py` already
+proved). A real correctness bug was caught by that new test before
+landing -- see `IMPLEMENTATION_STATUS.md`'s entry for detail -- and fixed.
+
+**What remains HARDWARE_PENDING:** this wiring has only been proven with
+scripted ASR/translation/VAD doubles on CPU. Real Silero VAD + real
+faster-whisper + real vLLM, driven through the actual gateway (not the
+standalone `tests/test_e2e_gpu.py` path that calls the orchestrator
+directly, bypassing the gateway entirely), talking to a real connected
+client, has not yet been confirmed. Staged as `GATEWAY-E2E-001` in
+`MANUAL_ACTIONS.md`. Until that returns, do not claim this project is
+ready for a real meeting on hardware -- only that the wiring itself is
+now real and locally proven, where before this change it did not exist
+at all.
+
+**Original finding, for history:** this gap was first flagged in Phase 08
+and remained true through the end of Phase 11 -- it was never assigned to
+any phase's required outcomes. The practical consequence at the time: a
+real client connected to a real running server produced no live captions,
+despite every individual piece (transport, VAD, ASR, translation, the
+orchestrator, the UI) being real, tested, and separately hardware-verified
+in isolation.
 
 ## Status legend
 

@@ -8,10 +8,11 @@ Composes components already built in Phases 04-07 (:class:`UtteranceSegmenter`,
 own deterministic heuristic checker. Frame ingestion and partial-decode
 ticking are driven by the caller (matches ``PartialDecodeScheduler``'s
 time-injected style); this class contains no real-time timer loop or
-WebSocket I/O and is not wired into the live gateway ingest path -- see
-"Known limitations" in ``IMPLEMENTATION_STATUS.md``, consistent with the
-Phase 05/06/07 precedent of building composable, testable domain logic
-first and deferring live wiring.
+WebSocket I/O of its own. The caller driving it in production is
+``server/transport/gateway.py`` (see ``OrchestrationDeps``/
+``_build_orchestrator``), which feeds released audio frames through VAD
+and calls ``ingest_frame``/``run_due_partial_decodes``/``flush_stream``,
+publishing whatever this class emits back over the live WebSocket.
 
 Soft silence (``SoftSilence``) triggers a *decision*, not automatic
 finalization: the deterministic heuristic runs immediately, and only for a
