@@ -4,14 +4,15 @@ Claude ghi các thao tác mà người dùng cần thực hiện tại đây.
 
 ## Pending actions
 
-Three actions staged after `UtteranceOrchestrator` was wired into the
+Four actions staged after `UtteranceOrchestrator` was wired into the
 live gateway (2026-08-15, at the user's direction). None is required to
 close out that work's own local scope (it is already LOCAL_VERIFIED with
 scripted doubles) -- these are the real-hardware acceptance test for it,
 per `CLAUDE.md`'s "never claim hardware verification from mocks", and
 the diagnostic trail for a real, unresolved finding hit while running
-it. `GATEWAY-E2E-001` is on hold pending `GATEWAY-E2E-003`'s test of the
-current leading hypothesis (`GATEWAY-E2E-002`'s own diagnostic tool,
+it. `GATEWAY-E2E-001` is on hold pending `GATEWAY-E2E-004`'s finalize
+-path tracing (`GATEWAY-E2E-003`'s VAD-timing hypothesis was disproved
+with real data; `GATEWAY-E2E-002`'s own diagnostic tool,
 `py-spy`, turned out to be unusable on this host -- see its entry).
 
 ### Action ID: GATEWAY-E2E-001
@@ -257,7 +258,23 @@ current leading hypothesis (`GATEWAY-E2E-002`'s own diagnostic tool,
 
 ### Action ID: GATEWAY-E2E-003
 
-- Status: WAITING_FOR_USER
+- Status: WAITING_FOR_USER (result in -- hypothesis disproved; see below.
+  Superseded by `GATEWAY-E2E-004`.)
+- Result (2026-08-15): Real Silero VAD probability drops to `0.0001`
+  within ~300ms of the tone stopping and stays there consistently across
+  all 60 sampled log lines -- clean, confident, unambiguous silence
+  detection. Hard-silence finalization should have triggered well within
+  the 8s (400-frame) silence budget sent. **This VAD-timing hypothesis
+  is disproved.** Client again printed exactly 3 partials then `TIMED
+  OUT`; server log again showed only the same 3
+  `faster_whisper Processing audio` lines and nothing further. A
+  diagnostic mistake was also caught here: the `grep ... UtteranceFinal`
+  used in earlier attempts proves nothing either way, since that VAD
+  event is never actually logged anywhere in this codebase -- its
+  absence from a grep isn't evidence. Full detail in
+  `USER_RESULTS.md`'s `GATEWAY-E2E-003` entry. `GATEWAY-E2E-004` adds
+  real tracing through the actual finalize code path instead
+  (commit `bc5564e`).
 - Purpose: `GATEWAY-E2E-002`'s `py-spy dump` failed -- `ptrace` is blocked
   in this host's container even as root ("Permission denied", no `sudo`
   available). But its other two findings are still real evidence:
@@ -428,6 +445,88 @@ current leading hypothesis (`GATEWAY-E2E-002`'s own diagnostic tool,
   - The VAD probability trend excerpt (paste as many of the `tail -60`
     lines as came out -- the actual numbers matter here).
   - The ASR/finalize activity excerpt.
+
+### Action ID: GATEWAY-E2E-004
+
+- Status: WAITING_FOR_USER
+- Purpose: Three attempts have now shown the same pattern: 3 real
+  partials, then nothing -- no 4th ASR log line, no error event, no
+  traceback -- with `py-spy` unusable and the VAD-timing hypothesis
+  disproved by real probability data (`GATEWAY-E2E-003`). The finalize
+  code path itself (`UtteranceOrchestrator._on_vad_event`'s
+  `UtteranceFinalized` branch -> `_finalize_utterance` ->
+  `_do_finalize_utterance` -> `FinalTranscriber.finalize`) has never
+  actually been traced -- the earlier `grep ... UtteranceFinal` checked
+  for something that was never logged in the first place, proving
+  nothing. New DEBUG logs (commit `bc5564e`) now trace every step: event
+  received, finalize task started, about to call
+  `FinalTranscriber.finalize`, got a result, or caught `AsrError` --
+  plus a catch-and-log for any other exception type (previously any
+  non-`AsrError` exception would propagate silently out of the
+  un-awaited background task with no visible log line at all). This
+  retry will show exactly which of those steps is the last one reached.
+- Run on: Same host/venv as prior `GATEWAY-E2E-*` actions.
+- Prerequisites: `git pull` first -- confirm with `git log -1 --oneline`
+  showing `bc5564e` or later.
+- Safety notes: Same as prior attempts (real GPU memory, synthetic sine
+  tone only). `LOG_LEVEL=DEBUG` again, for the same reason as
+  `GATEWAY-E2E-003`.
+- Commands:
+  ```bash
+  cd /workspace/meeting-translator
+  source .venv-asr/bin/activate
+  git pull
+  git log -1 --oneline   # confirm the new finalize-path tracing is present
+
+  pkill -f "uvicorn server.app:app" 2>/dev/null
+  sleep 1
+  LOG_LEVEL=DEBUG nohup uvicorn server.app:app --host 127.0.0.1 --port 3000 > gateway_e2e_server.log 2>&1 &
+  disown
+  sleep 5
+  curl -s http://127.0.0.1:3000/health/live
+
+  # Same client as GATEWAY-E2E-003 (400 silence frames) -- recreate
+  # /tmp/gateway_e2e_client.py if it's gone, unchanged from that action.
+  PYTHONPATH=/workspace/meeting-translator python /tmp/gateway_e2e_client.py > /tmp/gateway_e2e_client.log 2>&1
+  cat /tmp/gateway_e2e_client.log
+
+  echo "=== finalize-path trace (pipeline.py's new DEBUG lines) ==="
+  grep -E "finalize task|UtteranceFinalized|finalized reason" gateway_e2e_server.log
+  echo "=== any traceback ==="
+  grep -B2 -A20 "Traceback" gateway_e2e_server.log
+  echo "=== ASR activity ==="
+  grep "faster_whisper Processing audio" gateway_e2e_server.log
+
+  pkill -f "uvicorn server.app:app"
+  ```
+- Expected success indicators: The trace grep shows how far things get:
+  - Nothing at all -> `UtteranceFinalized` itself never fires (points
+    back to the segmenter/orchestrator's hard-silence logic despite the
+    clean VAD data -- would need its own follow-up).
+  - `"finalized reason=..."` appears but `"finalize task started"`
+    doesn't -> the task was spawned but never actually ran (an asyncio
+    scheduling question).
+  - `"finalize task started"` appears but `"calling
+    final_transcriber.finalize"` doesn't -> stuck between task start and
+    the call itself (unlikely, almost no code there, but now visible).
+  - `"calling final_transcriber.finalize"` appears but nothing after ->
+    stuck inside `FinalTranscriber.finalize`/`.transcribe()` itself, most
+    likely in the executor-bound real decode call -- back to a genuine
+    hang hypothesis, now narrowed to an exact location.
+  - A traceback appears -> the new catch-and-log caught something real;
+    paste it in full, this would finally be a concrete root cause.
+  Whichever of these it is, that is the actual answer -- report exactly
+  what appeared, not just "worked" or "didn't work".
+  Expected artifacts: `gateway_e2e_server.log`, `/tmp/gateway_e2e_client.log`.
+- Rollback or cleanup: `pkill -f "uvicorn server.app:app"` if still
+  running.
+- Return to Claude (secrets/hostnames redacted):
+  - The `git log -1 --oneline` output.
+  - The client's full printed output.
+  - The full finalize-path trace grep output (even if empty -- that's
+    informative too).
+  - The traceback grep output, if any.
+  - The ASR activity grep output.
 
 ### Action ID: GATEWAY-E2E-002
 

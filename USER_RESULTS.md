@@ -1200,6 +1200,50 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   probability log to `SileroVadModel` and retries with much more
   trailing silence (400 frames / 8s) to test this directly.
 
+### GATEWAY-E2E-003
+
+- Date: 2026-08-15
+- Environment: GPU server, `.venv-asr`, fresh server restart on
+  `127.0.0.1:3000` with `LOG_LEVEL=DEBUG`, updated client (400 silence
+  frames instead of 60).
+- Command summary: same pattern as prior attempts, plus
+  `grep "silero window probability" gateway_e2e_server.log | tail -60`
+  and `grep -E "faster_whisper|UtteranceFinal|error" gateway_e2e_server.log`.
+- Exit status: no traceback. Client again printed exactly 3 partials then
+  `TIMED OUT waiting for utterance.final`.
+- Result: **Hypothesis disproved.** Real Silero VAD probability drops to
+  `0.0001` within roughly 300ms of the tone stopping and stays there
+  consistently across all 60 sampled log lines -- clean, confident
+  silence detection, nothing ambiguous about it. Hard-silence
+  finalization (900ms of consecutive below-threshold frames) should have
+  triggered well within the 8s silence budget sent. This VAD-timing
+  hypothesis is ruled out.
+- Relevant output summary:
+  - Probability trend (representative, all 60 sampled lines identical):
+    `2026-08-15 13:40:00,303 DEBUG server.vad.silero silero window
+    probability=0.0001` ... (59 more identical lines through
+    `13:40:00,335`).
+  - ASR/finalize grep: only the same 3
+    `faster_whisper Processing audio with duration ...` lines as every
+    prior attempt (0.520/0.900/0.900), each followed by a
+    `faster_whisper Processing segment at 00:00.000` DEBUG line. No 4th
+    line. No `error`.
+  - **Diagnostic mistake self-identified**: the `grep -E "...
+    UtteranceFinal..."` was based on a wrong assumption -- the
+    `UtteranceFinalized` VAD event is never actually logged anywhere in
+    this codebase, so its absence from the grep proves nothing about
+    whether that event fired. This grep should not have been trusted as
+    evidence either way.
+- Redacted raw output file, if any: none.
+- Follow-up: With VAD timing ruled out, and the finalize path having no
+  actual tracing to show whether it even starts, `MANUAL_ACTIONS.md`'s
+  `GATEWAY-E2E-004` adds real DEBUG logs at each step of
+  `UtteranceOrchestrator`'s finalize path (`UtteranceFinalized` received
+  -> finalize task started -> calling `FinalTranscriber.finalize` -> got
+  a result or caught an error) plus a catch-and-log for any unexpected
+  exception type, and retries. This should pinpoint exactly where
+  execution stops, rather than continuing to guess.
+
 ## Result template
 
 ```markdown
