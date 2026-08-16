@@ -67,6 +67,7 @@ from server.vad.events import (
     ResumedSpeech,
     SoftSilence,
     SpeechStarted,
+    UtteranceAbandoned,
     UtteranceFinalized,
     VadEvent,
 )
@@ -251,6 +252,22 @@ class UtteranceOrchestrator:
             self._scheduler.stop(utterance.utterance_id)
             self._partial.stop_utterance(utterance.utterance_id)
             self._spawn(self._finalize_utterance(stream_id, utterance))
+        elif isinstance(event, UtteranceAbandoned):
+            # Not a real utterance (too little confirmed speech) -- the
+            # segmenter never emitted UtteranceFinalized, so without this
+            # cleanup the scheduler/partial-transcriber state for this
+            # utterance_id would be orphaned forever: run_due_partial_decodes
+            # would keep considering it "due" on every future tick, and
+            # decode() would keep hitting an empty window, for the lifetime
+            # of the session.
+            _LOG.debug(
+                "utterance %s abandoned (speech_ms=%d < min_speech_ms) -- releasing state",
+                event.utterance_id,
+                event.speech_ms,
+            )
+            state.pending_gen[event.utterance_id] = state.pending_gen.get(event.utterance_id, 0) + 1
+            self._scheduler.stop(event.utterance_id)
+            self._partial.stop_utterance(event.utterance_id)
 
     def _spawn(self, coro: Coroutine[object, object, None]) -> None:
         task = asyncio.ensure_future(coro)

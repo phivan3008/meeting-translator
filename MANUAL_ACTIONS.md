@@ -4,23 +4,21 @@ Claude ghi các thao tác mà người dùng cần thực hiện tại đây.
 
 ## Pending actions
 
-Seven actions staged after `UtteranceOrchestrator` was wired into the
-live gateway (2026-08-15, at the user's direction). None is required to
-close out that work's own local scope (it is already LOCAL_VERIFIED with
-scripted doubles) -- these are the real-hardware acceptance test for it,
-per `CLAUDE.md`'s "never claim hardware verification from mocks", and
-the diagnostic trail for a real, unresolved finding hit while running
-it. `GATEWAY-E2E-001` is on hold pending `GATEWAY-E2E-007`'s direct
-scheduler/decode tracing (`GATEWAY-E2E-006` proved all 475 packets were
-received, released and ingested with no loss and a clean client-side
-disconnect, ruling out every transport-layer explanation and reopening
-why only 3 real ASR decode calls ever happened; `GATEWAY-E2E-005`'s
-`faulthandler` thread dump showed the server genuinely idle, ruling out
-a hung executor call; `GATEWAY-E2E-004`'s finalize-path trace came back
-completely empty, ruling out the finalize code path; `GATEWAY-E2E-003`'s
-VAD-timing hypothesis was disproved with real data; `GATEWAY-E2E-002`'s
-own diagnostic tool, `py-spy`, turned out to be unusable on this host --
-see each entry).
+`GATEWAY-E2E-001` is **root-caused and fixed locally** as of
+2026-08-16, after a seven-attempt diagnostic trail
+(`GATEWAY-E2E-002`..`007`, see `GATEWAY-E2E-007`'s entry for the full
+root-cause writeup). The bug: `UtteranceSegmenter`'s intentional
+"too short utterance" discard path emitted no event at all, so
+`UtteranceOrchestrator` never released the partial-decode scheduler
+entry for it, permanently orphaning that utterance_id for the rest of
+the session. Fixed via a new `UtteranceAbandoned` event plus cleanup
+handling; locally verified with a new regression test. A real-hardware
+re-run is still needed to confirm `utterance.final` now actually
+arrives for a real utterance (the specific synthetic sine tone used by
+every `GATEWAY-E2E-*` attempt so far was separately found to be a poor
+match for real Silero VAD's "speech" classification, independent of
+the bug above) -- the next action is staged once the user decides how
+to get that real confirmation (see the question posed in chat).
 
 ### Action ID: GATEWAY-E2E-001
 
@@ -827,8 +825,77 @@ see each entry).
 
 ### Action ID: GATEWAY-E2E-007
 
-- Status: WAITING_FOR_USER
-- Purpose: `GATEWAY-E2E-006` proved all 475 audio frames reached
+- Status: WAITING_FOR_USER (**result in -- root cause found and fixed
+  locally.** See "Root cause" below; a real-hardware re-verification
+  action will be staged once the user decides how to proceed on test
+  audio -- see the note at the end of this entry.)
+- Result (2026-08-16): `"partial decode due"` fired exactly on schedule
+  every 500ms all the way from `now_ms=680` through `now_ms=9180` (18
+  firings, no gaps) -- the scheduler itself was never the problem. The
+  decode trace showed why nothing came of them: decode #3 (at
+  `total_ms=900`) computed `boundary_ms=29980` -- a faster-whisper
+  hallucination artifact (its internal fixed 30-second processing chunk
+  size) on the short/silent audio with `previous_text` conditioning --
+  which made `SlidingAudioWindow.advance()` drain the *entire* buffer
+  (`buffered_ms_after=0`). Every one of the following 15 due() firings
+  then hit `"empty window (total_ms=900)"` -- `total_ms` frozen forever,
+  proving `PartialTranscriber.append_audio` had stopped being called
+  entirely (not just that the window was trimmed), which only happens
+  if the segmenter's `current_utterance_id` became `None`.
+  - **Root cause**: `UtteranceSegmenter._finalize()` has an existing,
+    intentional "too short" path (`server/vad/state_machine.py`,
+    already covered by `tests/test_vad_state_machine.py`'s
+    `test_short_utterance_discarded_on_hard_silence`): if hard silence
+    is reached but confirmed `speech_ms` never crossed
+    `vad_min_speech_ms` (default 250ms), the utterance is silently
+    discarded -- `_reset_idle()` with **no event emitted at all**. This
+    is correct, deliberate filtering (e.g. a brief noise blip
+    shouldn't become a fake utterance) -- but nothing told
+    `UtteranceOrchestrator` it happened, so `PartialDecodeScheduler`'s
+    entry and `PartialTranscriber`'s state for that `utterance_id` were
+    orphaned forever: `due()` kept firing on a phantom utterance for
+    the rest of the session, and `decode()` kept hitting its
+    now-permanently-empty window on every tick.
+  - Separately: `tests/test_e2e_gpu.py` (the *other* GPU e2e test,
+    which always passes) feeds `orchestrator.ingest_frame(..., 0.9)`
+    with a **hardcoded** probability for every sine-tone frame,
+    bypassing real Silero entirely -- it only proves ASR/translation
+    wiring, not real VAD behavior. The live-gateway tests use real
+    `SileroVadModel.probability()`, and real Silero apparently only
+    recognizes a brief speech-like blip at the start of the pure
+    220Hz/0.2-amplitude tone (just enough to cross `speech_start_ms` and
+    open the utterance) before reading the rest as non-speech -- never
+    accumulating the confirmed `speech_ms` needed to avoid the
+    too-short discard. This means `utterance.final` was never going to
+    appear for this specific synthetic test audio against real VAD,
+    independent of the orchestration bug above.
+  - **Fix implemented and locally verified** (commit pending push): a
+    new `UtteranceAbandoned` VAD event (`server/vad/events.py`) is now
+    emitted from the too-short discard path instead of nothing;
+    `UtteranceOrchestrator._on_vad_event`
+    (`server/orchestration/pipeline.py`) handles it by releasing the
+    scheduler entry and partial-transcriber state (mirroring
+    `UtteranceFinalized`'s cleanup, minus publishing anything -- the
+    client still receives no event for a legitimately-too-short blip,
+    by design). Updated the existing state-machine test to assert the
+    new event, and added a new orchestration-level regression test
+    (`test_abandoned_short_utterance_releases_scheduler_and_partial_state`)
+    that directly proves `decode()` stops being invoked after
+    abandonment. `ruff format --check .`, `ruff check .`, `mypy client
+    server shared` clean; full CPU suite passes (423 passed).
+  - **What this fix does and does not resolve**: it closes the real
+    resource-leak/orphaned-scheduling bug for any too-short utterance in
+    production (a real brief noise blip would previously have caused
+    the exact same permanent stall this test hit). It does **not**, by
+    itself, make the current GATEWAY-E2E-* test client's sine tone
+    produce a real `utterance.final` -- that requires audio real Silero
+    will sustain as "speech" for over `min_speech_ms`, which the
+    existing synthetic tone was never doing. The next action depends on
+    how the user wants to get that real confirmation (louder/different
+    synthetic tone vs. a real microphone through the packaged Windows
+    client) -- see the question posed in chat; the next `GATEWAY-E2E-*`
+    action will be staged once that's decided.
+- Original purpose (for history): `GATEWAY-E2E-006` proved all 475 audio frames reached
   `orchestrator.ingest_frame` without exception, yet only 3 real ASR
   decode calls ever happened despite production settings
   (`whisper_partial_interval_ms=500`, `whisper_audio_overlap_ms=1500`)

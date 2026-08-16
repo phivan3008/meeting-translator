@@ -176,6 +176,53 @@ def test_hard_silence_finalizes_without_completeness_check() -> None:
     asyncio.run(run())
 
 
+def test_abandoned_short_utterance_releases_scheduler_and_partial_state() -> None:
+    """Regression test for GATEWAY-E2E-001..007's real finding.
+
+    A confirmed utterance with too little speech (below min_speech_ms) is
+    discarded by the VAD machine without a UtteranceFinalized event.
+    Without cleanup, the partial-decode scheduler keeps considering that
+    utterance_id "due" forever and decode() keeps hitting an empty window
+    on every future tick -- exactly what six real-hardware attempts hit
+    against the live gateway (see MANUAL_ACTIONS.md GATEWAY-E2E-007). This
+    asserts the orchestrator actually stops decoding for it once abandoned.
+    """
+
+    async def run() -> None:
+        model = ScriptedAsrModel([_result("hi", Language.JAPANESE)])
+        client = ScriptedTranslationClient(["OK"])
+        sink = _EventSink()
+        orch = _orchestrator(model, client, sink)
+        orch.add_stream(
+            "mic-01",
+            source=StreamSource.MICROPHONE,
+            source_language=Language.JAPANESE,
+            target_language=Language.VIETNAMESE,
+        )
+        try:
+            # 2 speech frames (40ms) < min_speech_ms=60ms, then 8 silence
+            # frames (160ms, >= hard_silence_ms=160ms): the utterance is
+            # abandoned, not finalized.
+            t = await _feed(orch, "mic-01", [0.9, 0.9] + [0.1] * 8)
+            calls_at_abandon = model.call_count
+
+            # Keep ticking well past where a live (non-abandoned) utterance
+            # would still be getting decoded periodically -- if the
+            # scheduler entry wasn't released, due() would keep firing and
+            # decode() would keep being invoked (on an ever-empty window).
+            for _ in range(20):
+                t += FRAME_MS
+                await orch.run_due_partial_decodes(now_ms=t)
+            await orch.wait_idle()
+        finally:
+            orch.close()
+
+        assert sink.finals() == []
+        assert model.call_count == calls_at_abandon
+
+    asyncio.run(run())
+
+
 def test_semantic_completion_finalizes_before_hard_silence() -> None:
     async def run() -> None:
         # A single segment ending in Japanese sentence-final punctuation:

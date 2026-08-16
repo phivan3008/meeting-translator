@@ -17,6 +17,7 @@ from server.vad.events import (
     ResumedSpeech,
     SoftSilence,
     SpeechStarted,
+    UtteranceAbandoned,
     UtteranceFinalized,
     VadEvent,
 )
@@ -222,6 +223,9 @@ class UtteranceSegmenter:
 
         too_short = self._speech_ms < self._config.min_speech_ms
         if self._speech_ms == 0 or (too_short and not forced):
+            events.append(
+                UtteranceAbandoned(utterance_id=self._utterance_id, speech_ms=self._speech_ms)
+            )
             self._reset_idle()
             return
 

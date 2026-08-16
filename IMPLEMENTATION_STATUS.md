@@ -2046,40 +2046,45 @@ wiring change itself).
 from audio-in to caption-out over the real live websocket -- is now real
 and proven, with scripted ASR/translation/VAD doubles on CPU
 (`tests/test_transport_gateway_orchestration.py`). Real-hardware
-verification (`GATEWAY-E2E-001`) is **in progress with a genuine,
-unresolved finding**: six attempts have all gotten real
-`transcription.partial` events (real Silero VAD, real faster-whisper,
-correct stable-prefix promotion) over the real live gateway -- proving
-the partial-decode path works end to end on real hardware -- but
-`utterance.final` has never arrived, and after six attempts it is now
-clear this is not a transport, finalize-path, or executor-hang bug.
-`py-spy` (`GATEWAY-E2E-002`) turned out to be unusable on this host
-(`ptrace` blocked even for root, no `sudo`). A VAD-timing hypothesis
-(`GATEWAY-E2E-003`) was disproved with real probability data. DEBUG
-tracing through the finalize code path (`GATEWAY-E2E-004`) ruled out the
-finalize path itself: `UtteranceFinalized` never fires. A `faulthandler`
-`SIGUSR1` all-threads stack dump (`GATEWAY-E2E-005`) ruled out a hung
-executor call: every thread was genuinely idle at the moment of the
-signal. Direct per-packet sequence tracing and a teardown summary
-(`GATEWAY-E2E-006`) then ruled out the transport layer entirely: all 475
-of the client's audio packets were received, released by the jitter
-buffer with zero loss, and (given the ingest loop never crashed) fed
-into `orchestrator.ingest_frame` without exception; the session ended
-via a normal client-initiated disconnect, not a server idle timeout.
-That reopens the real puzzle: with all audio genuinely ingested, only 3
-real ASR decode calls ever happened in the whole ~9.5s of audio-domain
-time, despite production settings (`whisper_partial_interval_ms=500`,
-`whisper_audio_overlap_ms=1500`) that should keep the scheduler firing
-roughly every 500ms and should keep the sliding window from emptying
-out this early -- neither the scheduler's code nor the sliding window's
-code shows an obvious stopping condition on static reading.
-`GATEWAY-E2E-007` adds direct tracing at both remaining decision points
-(whether the scheduler keeps considering the utterance due, and whether
-the decode window is ever actually empty) to settle it with real data
-instead of more inference. It is staged and `WAITING_FOR_USER` in
-`MANUAL_ACTIONS.md`; `GATEWAY-E2E-001` is on hold pending that trace.
-Per `CLAUDE.md`'s "never claim hardware verification from mocks," do not
-treat this project as ready for a real meeting until this resolves.
+verification (`GATEWAY-E2E-001`) hit a genuine bug across seven
+diagnostic attempts (`GATEWAY-E2E-002`..`007`), now **root-caused and
+fixed locally (2026-08-16)**: `UtteranceSegmenter`'s pre-existing,
+intentional "too short utterance" discard path (hard silence reached
+before confirmed `speech_ms` crosses `vad_min_speech_ms`, default
+250ms) emitted no event at all, so `UtteranceOrchestrator` never
+released the partial-decode scheduler entry or partial-transcriber
+state for that utterance_id -- orphaning it for the rest of the
+session. The scheduler kept correctly firing `due()` every 500ms as
+designed; each call just hit a permanently empty decode window,
+producing zero further ASR activity and, since the segmenter's own
+`UtteranceFinalized` event never fires for a discarded utterance, no
+`utterance.final` either. Fixed via a new `UtteranceAbandoned` VAD
+event (`server/vad/events.py`) that `UtteranceOrchestrator` now handles
+by releasing that state (mirroring `UtteranceFinalized`'s cleanup,
+minus publishing anything -- a legitimately-too-short blip still
+produces no client-visible event, by design). A new regression test
+(`test_abandoned_short_utterance_releases_scheduler_and_partial_state`
+in `tests/test_orchestration_pipeline.py`) directly proves `decode()`
+stops firing after abandonment; the pre-existing
+`test_short_utterance_discarded_on_hard_silence` was updated to assert
+the new event. All local checks pass.
+
+Separately (not a bug, a test-fixture limitation): every
+`GATEWAY-E2E-*` attempt used the same synthetic 220Hz/0.2-amplitude
+sine tone as `tests/test_e2e_gpu.py`'s audio -- but that other GPU test
+always passes because it feeds `orchestrator.ingest_frame(..., 0.9)`
+with a **hardcoded** VAD probability, bypassing real Silero entirely.
+The live-gateway tests use real `SileroVadModel.probability()`, which
+apparently only classifies a brief blip at the tone's onset as "speech"
+before reading the rest as non-speech -- meaning `utterance.final` was
+never going to appear for this specific synthetic audio against real
+VAD, independent of the bug above. Getting a real, hardware-verified
+`utterance.final` still requires one more `GATEWAY-E2E-*` attempt with
+audio real Silero will sustain as speech past `min_speech_ms` -- staged
+once the user decides how (adjusted synthetic tone vs. a real
+microphone through the packaged Windows client). Per `CLAUDE.md`'s
+"never claim hardware verification from mocks," do not treat this
+project as ready for a real meeting until that real confirmation lands.
 
 Two more things remain open after `GATEWAY-E2E-001`/`002` resolve,
 neither to be started without the user's explicit direction: the

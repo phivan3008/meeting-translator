@@ -1384,6 +1384,77 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   to 9500, and whether `PartialTranscriber.decode()`'s window is ever
   actually empty when called. Staged as `GATEWAY-E2E-007`.
 
+### GATEWAY-E2E-007
+
+- Date: 2026-08-16
+- Environment: GPU server, `.venv-asr`, fresh server restart on
+  `127.0.0.1:3000` with `LOG_LEVEL=DEBUG`, same client as every prior
+  `GATEWAY-E2E-*` attempt (400 silence frames after 75 sine-tone
+  frames).
+- Command summary: server + client run normally, then
+  `grep "partial decode due"` and
+  `grep -E "partial decode skipped|partial decode for|partial decode discarded"`
+  against `gateway_e2e_server.log`, plus the usual ASR activity grep.
+- Exit status: no traceback. Client again printed exactly 3 partials
+  then `TIMED OUT waiting for utterance.final`.
+- Result: **Root cause found.** `"partial decode due"` fired exactly on
+  schedule every 500ms from `now_ms=680` through `now_ms=9180` (18
+  firings, no gaps) -- the scheduler was never broken. Decode #3 (at
+  `total_ms=900`) computed `boundary_ms=29980` (a faster-whisper
+  hallucination artifact -- its internal fixed 30-second processing
+  chunk size -- on short/silent audio with `previous_text`
+  conditioning), which made `SlidingAudioWindow.advance()` drain the
+  entire buffer (`buffered_ms_after=0`). All 15 subsequent due()
+  firings then hit `"empty window (total_ms=900)"` -- `total_ms` frozen
+  forever, meaning `append_audio` had stopped being called entirely,
+  which only happens if the segmenter's `current_utterance_id` became
+  `None`.
+- Relevant output summary:
+  - `"partial decode due"`: 18 lines, `now_ms` climbing 680 -> 9180 in
+    exact 500ms steps, no gaps.
+  - Decode trace: 3 real decodes (matching the 3 partials), the 3rd
+    showing `boundary_ms=29980 window_advanced=True
+    buffered_ms_after=0`, followed by 15 `"empty window
+    (total_ms=900)"` lines with `total_ms` never changing.
+  - ASR activity: same 3 lines as every prior attempt.
+- Redacted raw output file, if any: none.
+- Follow-up: Traced the `current_utterance_id -> None` transition to
+  `UtteranceSegmenter._finalize()`'s pre-existing, intentional
+  "too short utterance" discard path (`server/vad/state_machine.py`):
+  if hard silence (900ms) is reached but confirmed `speech_ms` never
+  crossed `vad_min_speech_ms` (default 250ms), the utterance is
+  silently discarded with **no event emitted at all** -- already
+  covered by `tests/test_vad_state_machine.py`'s
+  `test_short_utterance_discarded_on_hard_silence`, which documented
+  exactly this "no event" behavior as expected. Since nothing told
+  `UtteranceOrchestrator`, `PartialDecodeScheduler`'s entry and
+  `PartialTranscriber`'s state for that `utterance_id` were orphaned
+  for the rest of the session. Separately confirmed why this
+  particular test audio triggers it: `tests/test_e2e_gpu.py` (the
+  other GPU e2e test, which always passes) feeds
+  `orchestrator.ingest_frame(..., 0.9)` with a **hardcoded**
+  probability for every sine-tone frame, bypassing real Silero
+  entirely. The live-gateway tests use real
+  `SileroVadModel.probability()`, which apparently only recognizes a
+  brief speech-like blip at the very start of the pure
+  220Hz/0.2-amplitude tone before reading the rest as non-speech --
+  never accumulating enough confirmed `speech_ms` to avoid the
+  too-short discard. Implemented and locally verified a fix: a new
+  `UtteranceAbandoned` VAD event, emitted from the discard path, that
+  `UtteranceOrchestrator` handles by releasing the scheduler/partial
+  state (mirroring `UtteranceFinalized`'s cleanup, minus publishing
+  anything -- the client still receives no event for a
+  legitimately-too-short blip, by design). Updated the existing
+  state-machine test and added a new orchestration-level regression
+  test proving `decode()` stops firing after abandonment. All local
+  checks clean (ruff format/check, mypy, full pytest suite). This
+  fixes a real production bug (any too-short utterance, e.g. a brief
+  noise blip, would previously have caused the same permanent stall)
+  but does not by itself make the current synthetic test tone produce
+  a real `utterance.final` -- that needs audio real Silero will sustain
+  as "speech" past `min_speech_ms`. Next action pending the user's
+  choice on how to get that real confirmation.
+
 ## Result template
 
 ```markdown

@@ -6,6 +6,7 @@ from server.vad.events import (
     ResumedSpeech,
     SoftSilence,
     SpeechStarted,
+    UtteranceAbandoned,
     UtteranceFinalized,
 )
 from server.vad.state_machine import UtteranceSegmenter
@@ -112,6 +113,10 @@ def test_short_utterance_discarded_on_hard_silence() -> None:
     probs = [0.9, 0.9] + [0.1] * 6
     events = _run(seg, probs)
     assert not any(isinstance(e, UtteranceFinalized) for e in events)
+    abandoned = [e for e in events if isinstance(e, UtteranceAbandoned)]
+    assert len(abandoned) == 1
+    assert abandoned[0].utterance_id == "utt-00001"
+    assert abandoned[0].speech_ms == 40
     assert seg.state is VadState.IDLE
 
 
