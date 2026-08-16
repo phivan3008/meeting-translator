@@ -17,11 +17,14 @@ to try a louder, more speech-like synthetic tone next (rather than
 switching to a real microphone) -- `GATEWAY-E2E-008` retried with an
 amplitude-modulated multi-formant waveform instead of a flat sine tone,
 but its unpaced 550-packet burst hit the WebSocket rate limiter and
-produced no usable ASR data at all. `GATEWAY-E2E-009` retries the same
+produced no usable ASR data at all. `GATEWAY-E2E-009` retried the same
 tone with real-time-paced sending (20ms per frame, matching a real
-client's cadence) to avoid the rate limiter and get a valid read on
-whether the tone change actually helps real Silero VAD sustain "speech"
-classification long enough for a genuine `utterance.final`.
+client's cadence) -- pacing worked (no rate-limit errors), but this
+time there was zero VAD activity of any kind, a regression from every
+earlier attempt with the plain sine tone. `GATEWAY-E2E-010` checks the
+already-logged real Silero probability numbers for this new tone
+directly (no server restart needed, just reading the existing log) to
+see whether it's simply a worse VAD trigger than the original tone.
 
 ### Action ID: GATEWAY-E2E-001
 
@@ -1181,8 +1184,34 @@ classification long enough for a genuine `utterance.final`.
 
 ### Action ID: GATEWAY-E2E-009
 
-- Status: WAITING_FOR_USER
-- Purpose: `GATEWAY-E2E-008`'s unpaced 550-packet burst hit the
+- Status: WAITING_FOR_USER (**result in -- pacing worked (zero rate
+  -limit errors), but zero VAD activity of any kind occurred either.**
+  Superseded by `GATEWAY-E2E-010`, not retried as-is.)
+- Result (2026-08-16): No `error` events at all this time (pacing
+  successfully avoided the rate limiter). But the client printed
+  *nothing* except `TIMED OUT waiting for utterance.final` -- not even
+  a single `transcription.partial`, unlike every prior attempt
+  (`GATEWAY-E2E-003` through `007`), which always got at least 3 real
+  partials from the plain sine tone. Server-side: zero abandonment
+  trace, zero finalize trace, zero ASR activity -- a full regression
+  compared to every attempt before the tone change.
+  - Since pacing only changes *when* bytes are sent, not their content,
+    and Silero classifies each frame independently of transmission
+    timing, this strongly suggests the actual problem is the tone
+    change from `GATEWAY-E2E-008`, not pacing: the louder,
+    multi-formant, amplitude-modulated waveform may be *worse* at
+    triggering real Silero's "speech" classification than the original
+    plain 220Hz tone was, not better -- a smooth AM-modulated mixture
+    lacks the original tone's sharp broadband onset transient, which
+    plausibly triggered Silero's initial blip in every earlier attempt.
+  - Rather than guess further, `GATEWAY-E2E-010` checks the actual
+    numbers: `server/vad/silero.py` already logs every window's real
+    probability at DEBUG level (used previously in `GATEWAY-E2E-003`
+    for the silence portion) -- this retry greps that log for the
+    first ~160 lines (covering the whole "speech" phase) to see
+    directly whether real Silero ever assigned this tone a probability
+    anywhere near the 0.5 threshold, no new code needed.
+- Original purpose (for history): `GATEWAY-E2E-008`'s unpaced 550-packet burst hit the
   WebSocket rate limiter and produced zero usable ASR data, making its
   louder/multi-formant tone change untested. This retry paces every
   packet send at the real `FRAME_MS` (20ms) interval it represents --
@@ -1344,6 +1373,61 @@ classification long enough for a genuine `utterance.final`.
   - The abandonment grep output (even if empty).
   - The finalize-path trace grep output (even if empty).
   - The ASR activity grep output.
+
+### Action ID: GATEWAY-E2E-010
+
+- Status: WAITING_FOR_USER
+- Purpose: `GATEWAY-E2E-009` got zero VAD activity of any kind for the
+  new multi-formant/AM-modulated tone. `server/vad/silero.py` already
+  logs every window's real probability at DEBUG level (no new code
+  needed) -- this checks those actual numbers directly instead of
+  guessing further whether Silero ever came close to classifying this
+  tone as speech. No server restart or client re-run needed:
+  `gateway_e2e_server.log` from `GATEWAY-E2E-009` is still on disk even
+  though that server process was killed at the end of that action --
+  just grep the existing file.
+- Run on: Same host, same shell session (or a fresh one) -- just needs
+  the file, not a running server.
+- Prerequisites: None beyond `gateway_e2e_server.log` from
+  `GATEWAY-E2E-009` still existing at
+  `/workspace/meeting-translator/gateway_e2e_server.log` (don't
+  recreate it -- if it's somehow gone, say so rather than re-running,
+  since a fresh run would need the same 20ms-paced send again).
+- Safety notes: Read-only; nothing to roll back.
+- Commands:
+  ```bash
+  cd /workspace/meeting-translator
+  echo "=== VAD probability during the speech phase (first 160 lines) ==="
+  grep "silero window probability" gateway_e2e_server.log | head -160
+  echo "=== total probability line count ==="
+  grep -c "silero window probability" gateway_e2e_server.log
+  echo "=== teardown counts ==="
+  grep "teardown counts" gateway_e2e_server.log
+  echo "=== disconnect / idle-timeout lines ==="
+  grep -E "client disconnected|idle timeout" gateway_e2e_server.log
+  ```
+- Expected success indicators: The probability trend during the first
+  ~150 lines (the "speech" phase) tells the story directly:
+  - If probabilities stay well below the 0.5 threshold throughout ->
+    confirms the new tone is simply a worse VAD trigger than the
+    original plain sine tone, and the next attempt should go back to
+    something closer to the original (or try a different synthetic
+    approach, or switch to a real microphone).
+  - If probabilities *do* cross 0.5 at some points but no `SpeechStarted`
+    -adjacent activity (partials/abandonment) ever showed up in
+    `GATEWAY-E2E-009` -> points to something else entirely (worth its
+    own follow-up), since `speech_start_ms` should only need ~160ms of
+    continuous crossing.
+  The teardown-counts and disconnect greps also confirm (or rule out) a
+  repeat of `GATEWAY-E2E-006`'s transport-layer question for this paced
+  run -- report those numbers too.
+  Expected artifacts: none new, this only reads the existing log.
+- Rollback or cleanup: None.
+- Return to Claude (secrets/hostnames redacted):
+  - The first 160 probability lines (or however many exist, if fewer).
+  - The total probability line count.
+  - The teardown-counts line (even if empty).
+  - The disconnect/idle-timeout grep output (even if empty).
 
 ### Action ID: GATEWAY-E2E-002
 

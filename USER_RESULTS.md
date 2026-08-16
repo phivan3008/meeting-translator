@@ -1494,6 +1494,41 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   uninterfered-with test against real Silero VAD, since this run's data
   is unusable for that question either way.
 
+### GATEWAY-E2E-009
+
+- Date: 2026-08-16
+- Environment: GPU server, `.venv-asr`, fresh server restart on
+  `127.0.0.1:3000` with `LOG_LEVEL=DEBUG`, same tone as `GATEWAY-E2E-008`
+  (louder, multi-formant, amplitude-modulated) but sent with real-time
+  pacing (20ms per frame) instead of an unpaced burst.
+- Command summary: server + client run normally, then error/abandonment
+  /finalize-path/ASR-activity greps against
+  `/tmp/gateway_e2e_client.log` and `gateway_e2e_server.log`.
+- Exit status: no traceback, no errors. Client printed only
+  `TIMED OUT waiting for utterance.final` -- no partials, no finals, no
+  errors at all.
+- Result: **Pacing worked, but zero VAD activity occurred either.** No
+  `OVERLOADED` errors this time (pacing successfully avoided the rate
+  limiter). But unlike every attempt from `GATEWAY-E2E-003` through
+  `007` (which always got at least 3 real partials from the original
+  plain sine tone), this run got nothing: zero partials, zero
+  abandonment trace, zero finalize trace, zero ASR activity.
+- Relevant output summary:
+  - Client output: only `TIMED OUT waiting for utterance.final`.
+  - Error grep: empty.
+  - Abandonment/finalize-path/ASR-activity greps: all empty.
+- Redacted raw output file, if any: none.
+- Follow-up: Since pacing only changes *when* bytes are sent, not their
+  content, and Silero classifies each frame independently of
+  transmission timing, this points at the tone change itself: the
+  louder, multi-formant, AM-modulated waveform may be a worse VAD
+  trigger than the original plain 220Hz tone, lacking its sharp onset
+  transient. `MANUAL_ACTIONS.md`'s `GATEWAY-E2E-010` checks the actual
+  logged Silero probability numbers for this tone directly (existing
+  DEBUG log line, no new code, no server restart -- just reads the
+  still-on-disk `gateway_e2e_server.log` from this run) instead of
+  guessing further.
+
 ## Result template
 
 ```markdown
