@@ -32,9 +32,11 @@ amplitude raises the onset spike's height, not its duration, since real
 Silero's response fades once a tone settles into a predictable,
 periodic shape. At the user's direction, synthetic-tone tuning is
 paused here in favor of testing with a real microphone through the
-packaged Windows client -- see the new action below, which is pending
-clarification on how the Windows machine can reach the GPU server
-(every server instance so far has only been bound to `127.0.0.1`).
+packaged Windows client -- `GATEWAY-E2E-012` is staged for this,
+spanning both the GPU pod (server, via the user's usual SSH/VS Code
+Kubernetes session) and Windows (client, reached via
+`kubectl port-forward` since the user confirmed that's their normal way
+of controlling the GPU server).
 
 ### Action ID: GATEWAY-E2E-001
 
@@ -1665,6 +1667,119 @@ clarification on how the Windows machine can reach the GPU server
   - The abandonment grep output (even if empty).
   - The finalize-path trace grep output (even if empty).
   - The ASR activity grep output.
+
+### Action ID: GATEWAY-E2E-012
+
+- Status: WAITING_FOR_USER
+- Purpose: Four rounds of synthetic-tone engineering (`GATEWAY-E2E-008`
+  through `011`) established that real Silero VAD responds to a
+  signal's *onset*, not its sustained shape -- no synthetic tone tried
+  so far sustains the 160ms of unbroken "speech" classification needed
+  to open an utterance. At the user's direction, this switches to a
+  real microphone through the packaged Windows client instead of
+  further synthetic tuning -- the actual real-world scenario this
+  feature is built for, and the definitive way to close out
+  `GATEWAY-E2E-001`. This is the first `GATEWAY-E2E-*` action spanning
+  two environments: the GPU server (inside your usual SSH/VS Code
+  Kubernetes session) and your Windows machine (running the packaged
+  client). Every prior server restart bound uvicorn to `127.0.0.1`
+  only -- unlike the Python test client, which always ran on the GPU
+  server itself, the Windows client needs a way to reach that port from
+  outside the pod. Since you mentioned you use `kubectl`/VS Code's
+  Kubernetes tooling with SSH into the pod, a `kubectl port-forward`
+  (run from Windows, not from inside the pod) is the natural fit --
+  `kubectl port-forward` reaches a loopback-bound port inside the pod
+  just fine, so **no change to the server's `--host` binding is
+  needed**.
+- Run on: Two places -- Part A inside the GPU pod (same as every prior
+  `GATEWAY-E2E-*` action), Part B on your Windows machine.
+- Prerequisites: `git pull` inside the pod first -- confirm with
+  `git log -1 --oneline` showing `cff90bd` or later (the orphaned-state
+  fix). The packaged Windows client from `WINDOWS-PACKAGE-001`
+  (`dist/MeetingTranslator-0.1.0/`) -- rebuild if that folder is gone
+  (see `docs/DEPLOYMENT.md`'s "Windows client packaging"); no server
+  -side change since that build affects the client, so a rebuild isn't
+  strictly required either way if the folder is still there.
+- Safety notes: You will be speaking real words into a real microphone
+  -- per `CLAUDE.md`, transcript/translation content is never logged by
+  default (only counts/metadata), so this is consistent with the
+  project's privacy rules. Use a short, disposable test phrase, not
+  anything sensitive.
+- Commands -- **Part A (inside the GPU pod, your normal SSH/remote
+  session)**:
+  ```bash
+  cd /workspace/meeting-translator
+  source .venv-asr/bin/activate
+  git pull
+  git log -1 --oneline   # confirm cff90bd or later
+
+  pkill -f "uvicorn server.app:app" 2>/dev/null
+  sleep 1
+  LOG_LEVEL=DEBUG nohup uvicorn server.app:app --host 127.0.0.1 --port 3000 > gateway_e2e_server.log 2>&1 &
+  disown
+  sleep 5
+  curl -s http://127.0.0.1:3000/health/live
+  ```
+  Leave this running (don't `pkill` it at the end this time -- the
+  Windows client needs it up for the whole test). Note the pod's name
+  (from your VS Code Kubernetes explorer, or `hostname` inside the pod,
+  or `kubectl get pods` from wherever you normally run it) for Part B.
+- Commands -- **Part B (on your Windows machine)**:
+  ```powershell
+  # 1. Forward the pod's port 3000 to your Windows machine's localhost:3000.
+  #    Replace <pod-name> and <namespace> with your actual values (use
+  #    VS Code's Kubernetes extension's "Port Forward" action on the pod
+  #    if that's easier than the CLI).
+  kubectl port-forward pod/<pod-name> 3000:3000 -n <namespace>
+  # Leave this running in its own terminal for the whole test.
+
+  # 2. In a second terminal, locate (or rebuild) the packaged client.
+  cd "F:\workspaces\fpt\projects\whalelm\Realtime-meeting-translator-v2\meeting-translator"
+  Get-ChildItem dist\MeetingTranslator-0.1.0 -ErrorAction SilentlyContinue
+  # If that folder does not exist, rebuild it first:
+  #   pip install -e ".[client,windows-audio,packaging]"
+  #   python scripts/build_windows_client.py --clean
+
+  # 3. Point the client at the port-forwarded server.
+  "CLIENT_SERVER_URL=ws://localhost:3000/ws/stream" | Out-File -Encoding utf8 dist\MeetingTranslator-0.1.0\.env
+
+  # 4. Launch the client.
+  Start-Process dist\MeetingTranslator-0.1.0\MeetingTranslator.exe
+  ```
+  In the app: select your real microphone as the input device, pick a
+  source/target language pair you can actually speak (e.g. source =
+  Vietnamese or Japanese, target = the other), click Connect, then
+  speak one short sentence, pause for a couple of seconds, and watch
+  the caption area.
+- Expected success indicators: Live partial captions should appear
+  while speaking (already proven working end-to-end in every
+  `GATEWAY-E2E-*` attempt so far), and -- this is the actual thing
+  being verified -- a finalized caption with a Vietnamese/Japanese
+  translation should appear a moment after you stop speaking and pause.
+  If nothing happens after a pause, check the pod's
+  `gateway_e2e_server.log` for the same trace lines used throughout
+  this diagnostic sequence
+  (`grep -E "abandoned|finalized reason|finalize task" gateway_e2e_server.log`)
+  to see what happened -- if it's abandoned again, report the
+  `speech_ms` value logged, since real speech should comfortably clear
+  `vad_min_speech_ms` (250ms) and this would be a genuinely new finding
+  worth its own follow-up.
+  Expected artifacts: what you observed in the client UI (described in
+  words, not a recording), plus the pod's `gateway_e2e_server.log` grep
+  output if anything looked wrong.
+- Rollback or cleanup: Close the client window; `Ctrl+C` the
+  `kubectl port-forward` terminal; inside the pod,
+  `pkill -f "uvicorn server.app:app"` when you're done testing (not
+  before, since this run stays up for the whole session unlike prior
+  actions).
+- Return to Claude (secrets/hostnames redacted -- describe what
+  happened, no need to paste raw transcript/translation content unless
+  you want to):
+  - Whether a live partial caption appeared while speaking.
+  - Whether a finalized caption + translation appeared after pausing.
+  - If not, the abandonment/finalize-path grep output from
+    `gateway_e2e_server.log`.
+  - Anything else notable (errors, disconnects, UI freezes).
 
 ### Action ID: GATEWAY-E2E-002
 
