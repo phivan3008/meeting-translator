@@ -1333,6 +1333,57 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   (`"client disconnected"` / `"... idle timeout"`) to see which side
   actually ended the session.
 
+### GATEWAY-E2E-006
+
+- Date: 2026-08-16
+- Environment: GPU server, `.venv-asr`, fresh server restart on
+  `127.0.0.1:3000` with `LOG_LEVEL=DEBUG`, same client as
+  `GATEWAY-E2E-003`/`004`/`005` (400 silence frames), run to completion
+  this time (not backgrounded).
+- Command summary: server + client run normally, then
+  `grep "packet decoded" ... | tail -20`, `grep -c "packet decoded"`,
+  `grep "teardown counts"`, `grep -E "client disconnected|idle timeout"`,
+  and the usual ASR activity grep against `gateway_e2e_server.log`.
+- Exit status: no traceback. Client again printed exactly 3 partials
+  then `TIMED OUT waiting for utterance.final`.
+- Result: **Transport layer ruled out entirely.** Total packets
+  received: 517 (475 real audio packets + 42 `KEEPALIVE` packets,
+  matching the client's own recv-timeout/keepalive loop). Teardown
+  counts: `received=517 released=475 lost=0 duplicates=0 stale=0` --
+  every single audio frame the client sent was released by the jitter
+  buffer and (since the ingest loop ran cleanly all the way to packet
+  517 with no crash) fed into `orchestrator.ingest_frame` without
+  exception. The session ended with `"client disconnected"` logged, not
+  `"idle timeout"` -- a normal client-initiated close, not a server
+  timeout.
+- Relevant output summary:
+  - Last 20 `packet decoded` lines: sequential keepalives (seq 498-517,
+    `flags=4 bytes=0`, one every ~3.003s, matching the client's 3s recv
+    timeout exactly).
+  - Total `packet decoded` count: 517.
+  - Teardown line: `received=517 released=475 lost=0 duplicates=0
+    stale=0`.
+  - Disconnect grep: `"client disconnected"` (only this, no idle
+    timeout).
+  - ASR activity: same 3 lines as every prior attempt.
+- Redacted raw output file, if any: none.
+- Follow-up: This reopens what `GATEWAY-E2E-004`'s reasoning seemed to
+  close: if all 475 frames were genuinely ingested,
+  `PartialTranscriber.append_audio` should have kept growing the
+  utterance's audio window the whole session, yet only 3 real ASR calls
+  ever happened. Checked `server/asr/partial_scheduler.py` (no stopping
+  condition other than an explicit `.stop()` call, only reachable via
+  `UtteranceFinalized`, already proven never to fire) and
+  `server/asr/sliding_window.py` against production defaults
+  (`whisper_partial_interval_ms=500`, `whisper_audio_overlap_ms=1500`,
+  the overlap comfortably exceeding the ~900ms stable boundary reached
+  at decode #3, meaning `advance()` should not have emptied the window
+  this early) -- neither explains the stoppage from static analysis
+  alone. Added direct tracing at both remaining decision points instead:
+  whether `PartialDecodeScheduler.due()` keeps firing as `now_ms` climbs
+  to 9500, and whether `PartialTranscriber.decode()`'s window is ever
+  actually empty when called. Staged as `GATEWAY-E2E-007`.
+
 ## Result template
 
 ```markdown

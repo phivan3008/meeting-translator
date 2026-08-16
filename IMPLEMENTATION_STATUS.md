@@ -2047,31 +2047,37 @@ from audio-in to caption-out over the real live websocket -- is now real
 and proven, with scripted ASR/translation/VAD doubles on CPU
 (`tests/test_transport_gateway_orchestration.py`). Real-hardware
 verification (`GATEWAY-E2E-001`) is **in progress with a genuine,
-unresolved finding**: five attempts have all gotten real
+unresolved finding**: six attempts have all gotten real
 `transcription.partial` events (real Silero VAD, real faster-whisper,
 correct stable-prefix promotion) over the real live gateway -- proving
 the partial-decode path works end to end on real hardware -- but
-`utterance.final` has never arrived. `py-spy` (`GATEWAY-E2E-002`) turned
-out to be unusable on this host (`ptrace` blocked even for root, no
-`sudo`). A VAD-timing hypothesis (`GATEWAY-E2E-003`) was disproved with
-real probability data (clean 0.0001 throughout the silence run). DEBUG
+`utterance.final` has never arrived, and after six attempts it is now
+clear this is not a transport, finalize-path, or executor-hang bug.
+`py-spy` (`GATEWAY-E2E-002`) turned out to be unusable on this host
+(`ptrace` blocked even for root, no `sudo`). A VAD-timing hypothesis
+(`GATEWAY-E2E-003`) was disproved with real probability data. DEBUG
 tracing through the finalize code path (`GATEWAY-E2E-004`) ruled out the
-finalize path itself entirely: `UtteranceFinalized` never fires, and the
-partial's `end_ms` plateauing at 900ms across two revisions shows audio
-ingestion into the orchestrator stalls around frame ~45. A `faulthandler`
-`SIGUSR1` all-threads stack dump (`GATEWAY-E2E-005`, added since `py-spy`
-doesn't work here) then ruled out a hung executor call too: every
-thread -- including the VAD `ThreadPoolExecutor` worker and the main
-event loop -- was genuinely idle at the moment of the signal, not
-suspended mid-call. So the problem is not a finalize bug, not
-VAD-timing, and not a hang inside a specific call; the rate limiter and
-jitter buffer are also ruled out structurally by code inspection. The
-open question is now whether the remaining ~430 of the client's 475
-packets ever reached the server's application layer at all --
-`GATEWAY-E2E-006` adds direct per-packet sequence-number logging plus a
-teardown summary of total received/released/lost/duplicate/stale counts
-to answer that with real data. It is staged and `WAITING_FOR_USER` in
-`MANUAL_ACTIONS.md`; `GATEWAY-E2E-001` is on hold pending that count.
+finalize path itself: `UtteranceFinalized` never fires. A `faulthandler`
+`SIGUSR1` all-threads stack dump (`GATEWAY-E2E-005`) ruled out a hung
+executor call: every thread was genuinely idle at the moment of the
+signal. Direct per-packet sequence tracing and a teardown summary
+(`GATEWAY-E2E-006`) then ruled out the transport layer entirely: all 475
+of the client's audio packets were received, released by the jitter
+buffer with zero loss, and (given the ingest loop never crashed) fed
+into `orchestrator.ingest_frame` without exception; the session ended
+via a normal client-initiated disconnect, not a server idle timeout.
+That reopens the real puzzle: with all audio genuinely ingested, only 3
+real ASR decode calls ever happened in the whole ~9.5s of audio-domain
+time, despite production settings (`whisper_partial_interval_ms=500`,
+`whisper_audio_overlap_ms=1500`) that should keep the scheduler firing
+roughly every 500ms and should keep the sliding window from emptying
+out this early -- neither the scheduler's code nor the sliding window's
+code shows an obvious stopping condition on static reading.
+`GATEWAY-E2E-007` adds direct tracing at both remaining decision points
+(whether the scheduler keeps considering the utterance due, and whether
+the decode window is ever actually empty) to settle it with real data
+instead of more inference. It is staged and `WAITING_FOR_USER` in
+`MANUAL_ACTIONS.md`; `GATEWAY-E2E-001` is on hold pending that trace.
 Per `CLAUDE.md`'s "never claim hardware verification from mocks," do not
 treat this project as ready for a real meeting until this resolves.
 

@@ -196,7 +196,13 @@ class UtteranceOrchestrator:
     async def run_due_partial_decodes(self, *, now_ms: int) -> list[TranscriptionPartial]:
         """Run and publish any partial decodes due at ``now_ms`` (caller-driven tick)."""
         published: list[TranscriptionPartial] = []
-        for utterance_id in self._scheduler.due(now_ms=now_ms):
+        due_ids = self._scheduler.due(now_ms=now_ms)
+        if due_ids:
+            # DEBUG-only: utterance ids and the frame-domain clock, never
+            # audio/transcript content -- traces whether the scheduler
+            # keeps firing periodically as expected.
+            _LOG.debug("partial decode due now_ms=%d utterance_ids=%s", now_ms, due_ids)
+        for utterance_id in due_ids:
             result = await self._partial.decode(utterance_id)
             if result is not None:
                 await self._publish(result)

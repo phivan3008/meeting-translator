@@ -4,20 +4,23 @@ Claude ghi các thao tác mà người dùng cần thực hiện tại đây.
 
 ## Pending actions
 
-Six actions staged after `UtteranceOrchestrator` was wired into the
+Seven actions staged after `UtteranceOrchestrator` was wired into the
 live gateway (2026-08-15, at the user's direction). None is required to
 close out that work's own local scope (it is already LOCAL_VERIFIED with
 scripted doubles) -- these are the real-hardware acceptance test for it,
 per `CLAUDE.md`'s "never claim hardware verification from mocks", and
 the diagnostic trail for a real, unresolved finding hit while running
-it. `GATEWAY-E2E-001` is on hold pending `GATEWAY-E2E-006`'s direct
-per-packet count (`GATEWAY-E2E-005`'s `faulthandler` thread dump showed
-the server genuinely idle, ruling out a hung executor call;
-`GATEWAY-E2E-004`'s finalize-path trace came back completely empty,
-ruling out the finalize code path; `GATEWAY-E2E-003`'s VAD-timing
-hypothesis was disproved with real data; `GATEWAY-E2E-002`'s own
-diagnostic tool, `py-spy`, turned out to be unusable on this host -- see
-each entry).
+it. `GATEWAY-E2E-001` is on hold pending `GATEWAY-E2E-007`'s direct
+scheduler/decode tracing (`GATEWAY-E2E-006` proved all 475 packets were
+received, released and ingested with no loss and a clean client-side
+disconnect, ruling out every transport-layer explanation and reopening
+why only 3 real ASR decode calls ever happened; `GATEWAY-E2E-005`'s
+`faulthandler` thread dump showed the server genuinely idle, ruling out
+a hung executor call; `GATEWAY-E2E-004`'s finalize-path trace came back
+completely empty, ruling out the finalize code path; `GATEWAY-E2E-003`'s
+VAD-timing hypothesis was disproved with real data; `GATEWAY-E2E-002`'s
+own diagnostic tool, `py-spy`, turned out to be unusable on this host --
+see each entry).
 
 ### Action ID: GATEWAY-E2E-001
 
@@ -698,8 +701,47 @@ each entry).
 
 ### Action ID: GATEWAY-E2E-006
 
-- Status: WAITING_FOR_USER
-- Purpose: `GATEWAY-E2E-005`'s thread dump showed the server genuinely
+- Status: WAITING_FOR_USER (**result in** -- all 475 audio frames were
+  released and ingested; the session ended via a clean client-side
+  disconnect, not a server idle timeout or a hang. Superseded by
+  `GATEWAY-E2E-007`, not retried.)
+- Result (2026-08-16): `received=517` (475 audio packets + 42
+  `KEEPALIVE` packets, matching the client's own timeout/keepalive
+  loop), `released=475` (every single audio frame -- matches the
+  client's 75 sine + 400 silence exactly), `lost=0`, `duplicates=0`,
+  `stale=0`. The session ended with `"client disconnected"` logged, not
+  `"idle timeout"` -- the client's own 60-iteration receive loop simply
+  ran its course and closed the connection normally afterward.
+  - This rules out every transport-layer explanation: packets were not
+    dropped, not lost to jitter-buffer overflow, and the server's own
+    idle timeout never fired (the client's keepalives kept it alive
+    throughout). All 475 real audio frames genuinely reached
+    `_handle_packet`'s released-frame loop and (since the ingest loop
+    never crashed, confirmed by clean processing all the way through
+    packet 517) were awaited into `orchestrator.ingest_frame` without
+    exception.
+  - This reopens the question `GATEWAY-E2E-004` seemed to answer: if all
+    475 frames really were ingested, `PartialTranscriber.append_audio`
+    should have kept growing the utterance's audio window the whole
+    time, and `end_ms` should have climbed well past 900ms on later
+    decodes -- yet only 3 real ASR calls ever happened. Checked the
+    partial-decode scheduler (`server/asr/partial_scheduler.py`) and
+    sliding window (`server/asr/sliding_window.py`) against production
+    defaults (`whisper_partial_interval_ms=500`,
+    `whisper_audio_overlap_ms=1500`): the scheduler has no cap or
+    stopping condition other than an explicit `.stop()` call (only
+    reachable via `UtteranceFinalized`, already proven never to fire),
+    and `overlap_ms=1500` exceeds the ~900ms stable boundary reached at
+    decode #3, meaning `SlidingAudioWindow.advance()` should not have
+    been draining the window to empty either. Neither explains the
+    stoppage by static analysis alone.
+  - Added direct tracing at the two remaining decision points instead
+    of further inference: whether `PartialDecodeScheduler.due()` keeps
+    firing at all as `now_ms` climbs to 9500, and whether
+    `PartialTranscriber.decode()`'s window is ever actually empty when
+    it's called. Staged as `GATEWAY-E2E-007`.
+- Original purpose (for history): `GATEWAY-E2E-005`'s thread dump showed
+  the server genuinely
   idle, not stuck inside a call -- ruling out the "hung executor"
   hypothesis. The open question is now: how many of the client's 475
   packets did the server's application layer (`_handle_packet`) actually
@@ -781,6 +823,86 @@ each entry).
   - The last-20 `packet decoded` lines and the total count.
   - The teardown-counts line(s).
   - The disconnect/idle-timeout grep output (even if empty).
+  - The ASR activity grep output.
+
+### Action ID: GATEWAY-E2E-007
+
+- Status: WAITING_FOR_USER
+- Purpose: `GATEWAY-E2E-006` proved all 475 audio frames reached
+  `orchestrator.ingest_frame` without exception, yet only 3 real ASR
+  decode calls ever happened despite production settings
+  (`whisper_partial_interval_ms=500`, `whisper_audio_overlap_ms=1500`)
+  that should keep the scheduler firing roughly every 500ms out to
+  9500ms (~16-19 expected decodes), and an overlap margin that should
+  keep the sliding window from ever emptying out this early. New DEBUG
+  logs (commit pending push) trace both remaining decision points
+  directly: `UtteranceOrchestrator.run_due_partial_decodes` now logs
+  every non-empty `due()` result (utterance ids + the frame-domain
+  clock), and `PartialTranscriber.decode()` now logs every skip reason
+  (no state, empty window with the buffered ms) as well as every
+  successful decode's window-advance outcome and buffered size
+  afterward, plus the duplicate-text suppression path. This should show
+  definitively whether the scheduler keeps firing (and decode() just
+  keeps hitting an empty window) or whether the scheduler itself stops
+  firing after the third call.
+- Run on: Same host/venv as prior `GATEWAY-E2E-*` actions.
+- Prerequisites: `git pull` first -- confirm with `git log -1 --oneline`
+  showing the new due()/decode() tracing commit.
+- Safety notes: Same as prior attempts (real GPU memory, synthetic sine
+  tone only). `LOG_LEVEL=DEBUG` required for these new lines.
+- Commands:
+  ```bash
+  cd /workspace/meeting-translator
+  source .venv-asr/bin/activate
+  git pull
+  git log -1 --oneline   # confirm the due()/decode() tracing commit is present
+
+  pkill -f "uvicorn server.app:app" 2>/dev/null
+  sleep 1
+  LOG_LEVEL=DEBUG nohup uvicorn server.app:app --host 127.0.0.1 --port 3000 > gateway_e2e_server.log 2>&1 &
+  disown
+  sleep 5
+  curl -s http://127.0.0.1:3000/health/live
+
+  PYTHONPATH=/workspace/meeting-translator python /tmp/gateway_e2e_client.py > /tmp/gateway_e2e_client.log 2>&1
+  cat /tmp/gateway_e2e_client.log
+
+  echo "=== partial decode due firings ==="
+  grep "partial decode due" gateway_e2e_server.log
+  echo "=== partial decode skip/advance/duplicate trace ==="
+  grep -E "partial decode skipped|partial decode for|partial decode discarded" gateway_e2e_server.log
+  echo "=== ASR activity ==="
+  grep "faster_whisper Processing audio" gateway_e2e_server.log
+
+  pkill -f "uvicorn server.app:app"
+  ```
+- Expected success indicators: Two distinct outcomes are possible, and
+  each points somewhere different:
+  - If `"partial decode due"` keeps appearing periodically all the way
+    up to `now_ms` near 9500, but each is immediately followed by
+    `"partial decode skipped for ...: empty window"` -> the scheduler is
+    fine; the sliding window is somehow emptying out (a real bug in
+    `SlidingAudioWindow`/`advance()` or in how `append_audio` interacts
+    with it, contradicting the `overlap_ms=1500` analysis -- worth a
+    closer look at the actual `buffered_ms` values logged).
+  - If `"partial decode due"` simply stops appearing after the 3rd
+    firing (around `now_ms` ~900) and never appears again despite later
+    packets clearly still being processed -> the scheduler itself is
+    the bug, contradicting the static code reading that found no
+    stopping condition -- would need to see the exact `now_ms` values
+    logged to spot what's really happening.
+  Report the actual line counts and a representative sample either way,
+  not just which of the two happened.
+  Expected artifacts: `gateway_e2e_server.log` (DEBUG-level, can be
+  large -- the three grep excerpts above are what to paste back),
+  `/tmp/gateway_e2e_client.log`.
+- Rollback or cleanup: `pkill -f "uvicorn server.app:app"` if still
+  running.
+- Return to Claude (secrets/hostnames redacted):
+  - The `git log -1 --oneline` output.
+  - The client's full printed output.
+  - The full `"partial decode due"` grep output.
+  - The full skip/advance/duplicate trace grep output.
   - The ASR activity grep output.
 
 ### Action ID: GATEWAY-E2E-002

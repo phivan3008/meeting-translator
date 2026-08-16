@@ -17,6 +17,7 @@ and this module does not alter their behavior.
 from __future__ import annotations
 
 import asyncio
+import logging
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -28,6 +29,8 @@ from server.asr.stable_prefix import StablePrefixTracker
 from server.asr.types import BYTES_PER_MS, AsrConfig, AsrRequest
 from shared.protocol.enums import Language
 from shared.protocol.messages import TranscriptionPartial
+
+_LOG = logging.getLogger("server.asr.partial")
 
 
 def _now() -> datetime:
@@ -133,9 +136,15 @@ class PartialTranscriber:
         """
         state = self._utterances.get(utterance_id)
         if state is None:
+            _LOG.debug("partial decode skipped for %s: no state (stopped?)", utterance_id)
             return None
         audio = state.window.window()
         if not audio:
+            _LOG.debug(
+                "partial decode skipped for %s: empty window (total_ms=%d)",
+                utterance_id,
+                state.total_ms,
+            )
             return None
 
         state.generation += 1
@@ -160,15 +169,33 @@ class PartialTranscriber:
         if state is None or state.generation != my_generation:
             # Utterance finalized/stopped, or a newer decode superseded this
             # one, while this decode was running off the event loop.
+            _LOG.debug(
+                "partial decode for %s discarded post-model: state_present=%s "
+                "generation_mismatch=%s",
+                utterance_id,
+                state is not None,
+                state is not None and state.generation != my_generation,
+            )
             return None
 
         merged = state.tracker.update(result.segments)
         boundary_ms = state.tracker.stable_boundary_ms(result.segments)
-        if state.window.advance(boundary_ms):
+        window_advanced = state.window.advance(boundary_ms)
+        if window_advanced:
             state.tracker.reset_window()
+        _LOG.debug(
+            "partial decode for %s: boundary_ms=%d window_advanced=%s "
+            "buffered_ms_after=%d total_ms=%d",
+            utterance_id,
+            boundary_ms,
+            window_advanced,
+            state.window.buffered_ms,
+            state.total_ms,
+        )
 
         published = (merged.stable_text, merged.unstable_text)
         if published == state.last_published:
+            _LOG.debug("partial decode for %s: duplicate text, not publishing", utterance_id)
             return None
         state.last_published = published
         state.revision += 1
