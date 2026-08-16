@@ -14,10 +14,14 @@ entry for it, permanently orphaning that utterance_id for the rest of
 the session. Fixed via a new `UtteranceAbandoned` event plus cleanup
 handling; locally verified with a new regression test. The user chose
 to try a louder, more speech-like synthetic tone next (rather than
-switching to a real microphone) -- `GATEWAY-E2E-008` retries with an
+switching to a real microphone) -- `GATEWAY-E2E-008` retried with an
 amplitude-modulated multi-formant waveform instead of a flat sine tone,
-to try to get real Silero VAD to sustain "speech" classification long
-enough for a genuine `utterance.final`.
+but its unpaced 550-packet burst hit the WebSocket rate limiter and
+produced no usable ASR data at all. `GATEWAY-E2E-009` retries the same
+tone with real-time-paced sending (20ms per frame, matching a real
+client's cadence) to avoid the rate limiter and get a valid read on
+whether the tone change actually helps real Silero VAD sustain "speech"
+classification long enough for a genuine `utterance.final`.
 
 ### Action ID: GATEWAY-E2E-001
 
@@ -973,8 +977,40 @@ enough for a genuine `utterance.final`.
 
 ### Action ID: GATEWAY-E2E-008
 
-- Status: WAITING_FOR_USER
-- Purpose: `GATEWAY-E2E-007` found and fixed a real orphaned-state bug
+- Status: WAITING_FOR_USER (**result in -- inconclusive on VAD, but
+  surfaced a real test-client defect: unpaced bursting hit the
+  WebSocket rate limiter.** Superseded by `GATEWAY-E2E-009`, not
+  retried as-is.)
+- Result (2026-08-16): The client printed ~45 `OVERLOADED` /
+  `"packet rate limit exceeded"` errors, all within a ~2ms window, then
+  `TIMED OUT waiting for utterance.final`. The server log showed **zero**
+  `"Processing audio"` lines and **zero** abandonment/finalize trace
+  lines -- no ASR activity happened at all this run, unlike every prior
+  attempt (which always got at least 3 real partials).
+  - Every prior `GATEWAY-E2E-*` client sent its audio in one unpaced
+    burst (`for i in range(N): await ws.send(...)`, no delay between
+    calls) and never once hit the rate limiter (`ws_rate_limit_burst`
+    defaults to 400, `ws_rate_limit_packets_per_sec` to 200) despite
+    sending 475 total packets -- more than the burst capacity on paper.
+    In hindsight this almost certainly worked only by accident: the
+    real ASR decode calls in those runs took real wall-clock time
+    (86-380ms each), which incidentally gave the token bucket enough
+    real elapsed time to refill between packets. This run's louder,
+    longer tone changed that timing in some way (exact mechanism not
+    fully pinned down and not worth chasing further), and the 550-packet
+    unpaced burst this time ran fast enough, and/or long enough past
+    burst capacity, to exhaust the bucket before enough refill occurred.
+  - Rather than keep depending on accidental timing to avoid the rate
+    limiter, `GATEWAY-E2E-009` fixes the client itself: pace every send
+    at the real `FRAME_MS` (20ms) interval it represents, matching how
+    a real audio client actually behaves (20ms of audio takes ~20ms to
+    capture) and comfortably staying under `ws_rate_limit_packets_per_sec`
+    regardless of total packet count. This also means the VAD-tone
+    change from `GATEWAY-E2E-008` (louder, multi-formant, amplitude
+    -modulated) has not yet been validly tested against real Silero --
+    the rate-limiter interference makes this run's data unusable for
+    that question either way.
+- Original purpose (for history): `GATEWAY-E2E-007` found and fixed a real orphaned-state bug
   (commit `cff90bd`), but also found that every prior attempt's
   synthetic 220Hz/0.2-amplitude sine tone was likely never going to
   sustain real Silero VAD's "speech" classification past
@@ -1139,6 +1175,172 @@ enough for a genuine `utterance.final`.
 - Return to Claude (secrets/hostnames redacted):
   - The `git log -1 --oneline` output.
   - The client's full printed output.
+  - The abandonment grep output (even if empty).
+  - The finalize-path trace grep output (even if empty).
+  - The ASR activity grep output.
+
+### Action ID: GATEWAY-E2E-009
+
+- Status: WAITING_FOR_USER
+- Purpose: `GATEWAY-E2E-008`'s unpaced 550-packet burst hit the
+  WebSocket rate limiter and produced zero usable ASR data, making its
+  louder/multi-formant tone change untested. This retry paces every
+  packet send at the real `FRAME_MS` (20ms) interval it represents --
+  matching how a real audio client actually behaves -- instead of
+  blasting everything as fast as Python can loop. This both avoids the
+  rate limiter regardless of the exact configured burst/rate values and
+  finally gives `GATEWAY-E2E-008`'s tone change a fair, uninterfered-with
+  test against real Silero VAD. Same tone generator as `GATEWAY-E2E-008`
+  (louder, multi-formant, amplitude-modulated), unchanged.
+- Run on: Same host/venv as prior `GATEWAY-E2E-*` actions.
+- Prerequisites: `git pull` first -- confirm with `git log -1 --oneline`
+  showing `cff90bd` or later (no new server-side commit for this
+  action; only the client script changes).
+- Safety notes: Same as prior attempts (real GPU memory, synthetic
+  audio only). This run takes noticeably longer in real time (~11s just
+  to send all 550 paced packets, plus however long the recv loop needs)
+  -- that is expected, not a hang.
+- Commands:
+  ```bash
+  cd /workspace/meeting-translator
+  source .venv-asr/bin/activate
+  git pull
+  git log -1 --oneline
+
+  pkill -f "uvicorn server.app:app" 2>/dev/null
+  sleep 1
+  LOG_LEVEL=DEBUG nohup uvicorn server.app:app --host 127.0.0.1 --port 3000 > gateway_e2e_server.log 2>&1 &
+  disown
+  sleep 5
+  curl -s http://127.0.0.1:3000/health/live
+
+  cat > /tmp/gateway_e2e_client.py << 'EOF'
+  import asyncio
+  import json
+  import math
+  import struct
+  from datetime import UTC, datetime
+
+  import websockets
+
+  from shared.protocol.binary import AudioFlags, encode_packet
+  from shared.protocol.enums import Language, StreamSource
+  from shared.protocol.messages import SessionStart, StreamConfig
+
+  FRAME_MS = 20
+  SAMPLE_RATE = 16000
+  FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
+  SPEECH_FRAME_COUNT = 150  # 3s
+  SILENCE_FRAME_COUNT = 400  # 8s
+  FORMANTS_HZ = (180.0, 700.0, 1200.0, 2400.0)
+
+  def speech_like_frame(frame_index: int, amplitude: float = 0.8) -> bytes:
+      samples = []
+      for i in range(FRAME_SAMPLES):
+          t = (frame_index * FRAME_SAMPLES + i) / SAMPLE_RATE
+          envelope = 0.5 + 0.5 * math.sin(2 * math.pi * 4.0 * t)
+          value = sum(math.sin(2 * math.pi * f * t) for f in FORMANTS_HZ) / len(FORMANTS_HZ)
+          value = max(-1.0, min(1.0, value * amplitude * envelope))
+          samples.append(int(value * 32767))
+      return struct.pack(f"<{FRAME_SAMPLES}h", *samples)
+
+  def silence_frame() -> bytes:
+      return b"\x00\x00" * FRAME_SAMPLES
+
+  async def main() -> None:
+      session_start = SessionStart(
+          session_id="sess-gateway-e2e-009",
+          client_id="gateway-e2e-client",
+          timestamp=datetime.now(UTC),
+          streams=[
+              StreamConfig(
+                  stream_number=1,
+                  stream_id="mic-01",
+                  source=StreamSource.MICROPHONE,
+                  source_language=Language.JAPANESE,
+                  target_language=Language.VIETNAMESE,
+              )
+          ],
+      )
+      async with websockets.connect("ws://127.0.0.1:3000/ws/stream") as ws:
+          await ws.send(session_start.model_dump_json())
+
+          # Real-time pacing: send each frame roughly as fast as it would
+          # actually be captured, instead of blindly bursting everything
+          # at once. Avoids the WebSocket rate limiter regardless of the
+          # exact configured burst/rate, and is a more faithful stand-in
+          # for a real client.
+          seq = 0
+          for i in range(SPEECH_FRAME_COUNT):
+              packet = encode_packet(
+                  stream_number=1, sequence_number=seq, client_timestamp_ms=seq * FRAME_MS,
+                  payload=speech_like_frame(i),
+              )
+              await ws.send(packet)
+              seq += 1
+              await asyncio.sleep(FRAME_MS / 1000)
+          for _ in range(SILENCE_FRAME_COUNT):
+              packet = encode_packet(
+                  stream_number=1, sequence_number=seq, client_timestamp_ms=seq * FRAME_MS,
+                  payload=silence_frame(),
+              )
+              await ws.send(packet)
+              seq += 1
+              await asyncio.sleep(FRAME_MS / 1000)
+
+          final_seen = False
+          for _ in range(60):
+              try:
+                  raw = await asyncio.wait_for(ws.recv(), timeout=3)
+              except asyncio.TimeoutError:
+                  seq += 1
+                  await ws.send(
+                      encode_packet(
+                          stream_number=1, sequence_number=seq,
+                          client_timestamp_ms=seq * FRAME_MS, payload=b"",
+                          flags=AudioFlags.KEEPALIVE,
+                      )
+                  )
+                  continue
+              event = json.loads(raw)
+              if event["type"] in ("transcription.partial", "utterance.final", "error"):
+                  print(f"{event['type']}: {event}")
+              if event["type"] == "utterance.final":
+                  final_seen = True
+                  break
+          if not final_seen:
+              print("TIMED OUT waiting for utterance.final")
+
+  asyncio.run(main())
+  EOF
+  PYTHONPATH=/workspace/meeting-translator python /tmp/gateway_e2e_client.py > /tmp/gateway_e2e_client.log 2>&1
+  cat /tmp/gateway_e2e_client.log
+
+  echo "=== any errors ==="
+  grep '"error"' /tmp/gateway_e2e_client.log
+  echo "=== abandonment trace (if the tone is still too short) ==="
+  grep "abandoned" gateway_e2e_server.log
+  echo "=== finalize-path trace (if it actually finalized this time) ==="
+  grep -E "finalize task|finalized reason" gateway_e2e_server.log
+  echo "=== ASR activity ==="
+  grep "faster_whisper Processing audio" gateway_e2e_server.log
+
+  pkill -f "uvicorn server.app:app"
+  ```
+- Expected success indicators: No `OVERLOADED` errors this time (real
+  pacing should avoid the rate limiter entirely) and, ideally, real ASR
+  activity (unlike `GATEWAY-E2E-008`'s zero). From there, same two
+  outcomes as before: `utterance.final` actually appears (the real
+  confirmation `GATEWAY-E2E-001` has been chasing), or it's still
+  abandoned but the log now shows the real `speech_ms` reached. Report
+  the actual outcome either way.
+  Expected artifacts: `gateway_e2e_server.log`, `/tmp/gateway_e2e_client.log`.
+- Rollback or cleanup: `pkill -f "uvicorn server.app:app"` if still
+  running.
+- Return to Claude (secrets/hostnames redacted):
+  - The `git log -1 --oneline` output.
+  - The client's full printed output.
+  - Whether any `error` events appeared at all.
   - The abandonment grep output (even if empty).
   - The finalize-path trace grep output (even if empty).
   - The ASR activity grep output.

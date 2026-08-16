@@ -1455,6 +1455,45 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   as "speech" past `min_speech_ms`. Next action pending the user's
   choice on how to get that real confirmation.
 
+### GATEWAY-E2E-008
+
+- Date: 2026-08-16
+- Environment: GPU server, `.venv-asr`, fresh server restart on
+  `127.0.0.1:3000` with `LOG_LEVEL=DEBUG`, new client with a louder
+  (0.8 amplitude), multi-formant, amplitude-modulated tone (150 speech
+  frames + 400 silence frames = 550 total, sent unpaced).
+- Command summary: server + client run normally, then
+  `grep "abandoned"`, `grep -E "finalize task|finalized reason"`, and
+  the usual ASR activity grep against `gateway_e2e_server.log`.
+- Exit status: no traceback. Client printed ~45 `OVERLOADED` /
+  `"packet rate limit exceeded"` error events (all within a ~2ms
+  window), then `TIMED OUT waiting for utterance.final`.
+- Result: **Inconclusive on the VAD question -- surfaced a real
+  test-client defect instead.** The server log showed zero
+  `"Processing audio"` lines and zero abandonment/finalize trace lines
+  -- no ASR activity happened at all, unlike every prior attempt (which
+  always got at least 3 real partials). Every prior client sent its
+  audio in one unpaced burst and never hit the rate limiter despite
+  475 total packets already exceeding the 400-token burst on paper --
+  almost certainly by accident, since the real ASR decode calls in
+  those runs (86-380ms each) gave the token bucket real elapsed time to
+  refill between packets. This run's tone/timing differences apparently
+  broke that lucky accident, exhausting the bucket before enough refill
+  happened.
+- Relevant output summary:
+  - Client: ~45 `error` lines, all `code: OVERLOADED`, all timestamped
+    within ~2ms of each other, then `TIMED OUT`.
+  - Abandonment/finalize-path/ASR activity greps: all empty.
+- Redacted raw output file, if any: none.
+- Follow-up: Rather than depend on accidental timing to avoid the rate
+  limiter, `MANUAL_ACTIONS.md`'s `GATEWAY-E2E-009` fixes the client
+  itself: pace every send at the real `FRAME_MS` (20ms) interval it
+  represents, matching how a real audio client actually behaves. This
+  both avoids the rate limiter regardless of the exact configured
+  burst/rate and gives the tone change from this attempt a fair,
+  uninterfered-with test against real Silero VAD, since this run's data
+  is unusable for that question either way.
+
 ## Result template
 
 ```markdown
