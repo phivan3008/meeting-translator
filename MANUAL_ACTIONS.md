@@ -21,10 +21,14 @@ produced no usable ASR data at all. `GATEWAY-E2E-009` retried the same
 tone with real-time-paced sending (20ms per frame, matching a real
 client's cadence) -- pacing worked (no rate-limit errors), but this
 time there was zero VAD activity of any kind, a regression from every
-earlier attempt with the plain sine tone. `GATEWAY-E2E-010` checks the
-already-logged real Silero probability numbers for this new tone
-directly (no server restart needed, just reading the existing log) to
-see whether it's simply a worse VAD trigger than the original tone.
+earlier attempt with the plain sine tone. `GATEWAY-E2E-010` confirmed
+why: the multi-formant/AM-modulated tone's probability never crossed
+the 0.5 threshold at all (peak 0.3493) -- it was a worse VAD trigger
+than the original plain tone, not better. `GATEWAY-E2E-011` reverts to
+the single-tone design (known to at least open `SpeechStarted`),
+changes only amplitude (0.2 -> 0.5) as one isolated adjustment, keeps
+the pacing fix, and captures the real probability trace this time
+(never directly checked for the speech portion in any prior attempt).
 
 ### Action ID: GATEWAY-E2E-001
 
@@ -1376,8 +1380,41 @@ see whether it's simply a worse VAD trigger than the original tone.
 
 ### Action ID: GATEWAY-E2E-010
 
-- Status: WAITING_FOR_USER
-- Purpose: `GATEWAY-E2E-009` got zero VAD activity of any kind for the
+- Status: WAITING_FOR_USER (**result in -- definitive: the new tone
+  never crosses the VAD threshold at all.** Superseded by
+  `GATEWAY-E2E-011`, not retried as-is.)
+- Result (2026-08-16): Peak probability across the entire speech phase
+  (343 total probability lines) was **0.3493**, at the very first
+  window -- never once reaching the 0.5 threshold. The trace decays
+  from there (0.2069 -> ... -> settling at the same 0.0001 floor seen
+  for pure digital silence) and never spikes again. Teardown counts:
+  `received=562 released=550 lost=0 duplicates=0 stale=0`, ended with
+  `"client disconnected"` -- transport layer fully healthy for this
+  paced run; this is purely a waveform-design problem.
+  - This fully explains `GATEWAY-E2E-009`'s zero VAD activity:
+    `is_speech = probability >= threshold` was never true even once, so
+    the segmenter never left `IDLE` -- no `SpeechStarted`, hence
+    nothing downstream ever had a chance to run.
+  - In hindsight, the `GATEWAY-E2E-008` tone change (multi-formant mix
+    + AM envelope, changing multiple variables in the waveform at once)
+    was a worse VAD trigger than the original plain 220Hz/0.2-amplitude
+    tone, not better -- a smooth, purely periodic multi-tone signal
+    plausibly reads as *more* clearly non-speech to a neural VAD than a
+    single tone's sharper onset transient. Every attempt using the
+    *original* tone (`GATEWAY-E2E-003` through `007`) did successfully
+    open `SpeechStarted` (proven indirectly by real ASR decode
+    activity, since that only starts from a `SpeechStarted` handler)
+    -- but its actual probability trace was never directly captured,
+    since every prior check only grepped the *silence* portion.
+  - `GATEWAY-E2E-011` reverts to the single-tone design (the one
+    variable we know at least partially works), makes one modest,
+    isolated adjustment (amplitude 0.2 -> 0.5, nothing else changed),
+    keeps the pacing fix from `GATEWAY-E2E-009` (needed regardless),
+    and this time captures the full probability trace during the
+    speech phase directly -- giving real data on a design closer to the
+    known-working baseline instead of another blind multi-variable
+    change.
+- Original purpose (for history): `GATEWAY-E2E-009` got zero VAD activity of any kind for the
   new multi-formant/AM-modulated tone. `server/vad/silero.py` already
   logs every window's real probability at DEBUG level (no new code
   needed) -- this checks those actual numbers directly instead of
@@ -1428,6 +1465,171 @@ see whether it's simply a worse VAD trigger than the original tone.
   - The total probability line count.
   - The teardown-counts line (even if empty).
   - The disconnect/idle-timeout grep output (even if empty).
+
+### Action ID: GATEWAY-E2E-011
+
+- Status: WAITING_FOR_USER
+- Purpose: `GATEWAY-E2E-010` proved the multi-formant/AM-modulated tone
+  never crosses the 0.5 VAD threshold at all (peak 0.3493). Reverts to
+  the single-tone design used successfully in `GATEWAY-E2E-003` through
+  `007` (the design we know at least opens `SpeechStarted`, evidenced
+  indirectly by real ASR decode activity in every one of those runs),
+  changing exactly one variable from that known baseline -- amplitude
+  0.2 -> 0.5 -- rather than another multi-variable guess. Keeps the
+  real-time pacing fix from `GATEWAY-E2E-009` (needed regardless of
+  tone shape) and, unlike every prior attempt, captures the full
+  probability trace during the speech phase directly this time, so we
+  finally see real numbers for this design instead of only inferring
+  its behavior indirectly.
+- Run on: Same host/venv as prior `GATEWAY-E2E-*` actions.
+- Prerequisites: `git pull` first -- confirm with `git log -1 --oneline`
+  showing `cff90bd` or later (no new server-side commit needed; only
+  the client script changes).
+- Safety notes: Same as prior attempts (real GPU memory, synthetic
+  audio only). Takes a similar amount of real time as `GATEWAY-E2E-009`
+  (~11s to send all 550 paced packets, plus recv time).
+- Commands:
+  ```bash
+  cd /workspace/meeting-translator
+  source .venv-asr/bin/activate
+  git pull
+  git log -1 --oneline
+
+  pkill -f "uvicorn server.app:app" 2>/dev/null
+  sleep 1
+  LOG_LEVEL=DEBUG nohup uvicorn server.app:app --host 127.0.0.1 --port 3000 > gateway_e2e_server.log 2>&1 &
+  disown
+  sleep 5
+  curl -s http://127.0.0.1:3000/health/live
+
+  cat > /tmp/gateway_e2e_client.py << 'EOF'
+  import asyncio
+  import json
+  import math
+  import struct
+  from datetime import UTC, datetime
+
+  import websockets
+
+  from shared.protocol.binary import AudioFlags, encode_packet
+  from shared.protocol.enums import Language, StreamSource
+  from shared.protocol.messages import SessionStart, StreamConfig
+
+  FRAME_MS = 20
+  SAMPLE_RATE = 16000
+  FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
+  SPEECH_FRAME_COUNT = 150  # 3s
+  SILENCE_FRAME_COUNT = 400  # 8s
+
+  def sine_frame(frame_index: int, frequency_hz: float = 220.0, amplitude: float = 0.5) -> bytes:
+      samples = []
+      for i in range(FRAME_SAMPLES):
+          t = (frame_index * FRAME_SAMPLES + i) / SAMPLE_RATE
+          value = amplitude * math.sin(2 * math.pi * frequency_hz * t)
+          samples.append(int(value * 32767))
+      return struct.pack(f"<{FRAME_SAMPLES}h", *samples)
+
+  def silence_frame() -> bytes:
+      return b"\x00\x00" * FRAME_SAMPLES
+
+  async def main() -> None:
+      session_start = SessionStart(
+          session_id="sess-gateway-e2e-011",
+          client_id="gateway-e2e-client",
+          timestamp=datetime.now(UTC),
+          streams=[
+              StreamConfig(
+                  stream_number=1,
+                  stream_id="mic-01",
+                  source=StreamSource.MICROPHONE,
+                  source_language=Language.JAPANESE,
+                  target_language=Language.VIETNAMESE,
+              )
+          ],
+      )
+      async with websockets.connect("ws://127.0.0.1:3000/ws/stream") as ws:
+          await ws.send(session_start.model_dump_json())
+
+          seq = 0
+          for i in range(SPEECH_FRAME_COUNT):
+              packet = encode_packet(
+                  stream_number=1, sequence_number=seq, client_timestamp_ms=seq * FRAME_MS,
+                  payload=sine_frame(i),
+              )
+              await ws.send(packet)
+              seq += 1
+              await asyncio.sleep(FRAME_MS / 1000)
+          for _ in range(SILENCE_FRAME_COUNT):
+              packet = encode_packet(
+                  stream_number=1, sequence_number=seq, client_timestamp_ms=seq * FRAME_MS,
+                  payload=silence_frame(),
+              )
+              await ws.send(packet)
+              seq += 1
+              await asyncio.sleep(FRAME_MS / 1000)
+
+          final_seen = False
+          for _ in range(60):
+              try:
+                  raw = await asyncio.wait_for(ws.recv(), timeout=3)
+              except asyncio.TimeoutError:
+                  seq += 1
+                  await ws.send(
+                      encode_packet(
+                          stream_number=1, sequence_number=seq,
+                          client_timestamp_ms=seq * FRAME_MS, payload=b"",
+                          flags=AudioFlags.KEEPALIVE,
+                      )
+                  )
+                  continue
+              event = json.loads(raw)
+              if event["type"] in ("transcription.partial", "utterance.final", "error"):
+                  print(f"{event['type']}: {event}")
+              if event["type"] == "utterance.final":
+                  final_seen = True
+                  break
+          if not final_seen:
+              print("TIMED OUT waiting for utterance.final")
+
+  asyncio.run(main())
+  EOF
+  PYTHONPATH=/workspace/meeting-translator python /tmp/gateway_e2e_client.py > /tmp/gateway_e2e_client.log 2>&1
+  cat /tmp/gateway_e2e_client.log
+
+  echo "=== VAD probability during the speech phase (first 160 lines) ==="
+  grep "silero window probability" gateway_e2e_server.log | head -160
+  echo "=== abandonment trace ==="
+  grep "abandoned" gateway_e2e_server.log
+  echo "=== finalize-path trace ==="
+  grep -E "finalize task|finalized reason" gateway_e2e_server.log
+  echo "=== ASR activity ==="
+  grep "faster_whisper Processing audio" gateway_e2e_server.log
+
+  pkill -f "uvicorn server.app:app"
+  ```
+- Expected success indicators: The probability trace during the speech
+  phase now tells us, for the first time, exactly how this design
+  behaves: how high it peaks, whether it sustains above 0.5 for
+  multiple consecutive frames (needs >= `speech_start_ms`/`FRAME_MS` = 8
+  consecutive frames >= threshold to open `SpeechStarted` at all,
+  matching `vad_speech_start_ms=160`), and how long before it drops
+  back down. From there: `utterance.final` actually appearing is the
+  real confirmation `GATEWAY-E2E-001` has been chasing; still no final
+  but a logged `"abandoned"` line with a real `speech_ms` number is
+  usable tuning data; and either way we now have the numbers to make an
+  informed call on whether further synthetic tuning is worth it or
+  real-microphone testing is the better next step.
+  Expected artifacts: `gateway_e2e_server.log`, `/tmp/gateway_e2e_client.log`.
+- Rollback or cleanup: `pkill -f "uvicorn server.app:app"` if still
+  running.
+- Return to Claude (secrets/hostnames redacted):
+  - The `git log -1 --oneline` output.
+  - The client's full printed output.
+  - The full probability trace (first 160 lines) -- this is the whole
+    point of the action, paste it in full even if long.
+  - The abandonment grep output (even if empty).
+  - The finalize-path trace grep output (even if empty).
+  - The ASR activity grep output.
 
 ### Action ID: GATEWAY-E2E-002
 

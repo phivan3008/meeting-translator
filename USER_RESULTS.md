@@ -1529,6 +1529,44 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   still-on-disk `gateway_e2e_server.log` from this run) instead of
   guessing further.
 
+### GATEWAY-E2E-010
+
+- Date: 2026-08-16
+- Environment: GPU server; read-only grep of the existing
+  `gateway_e2e_server.log` from `GATEWAY-E2E-009`'s run, no server
+  restart or client re-run.
+- Command summary: `grep "silero window probability" ... | head -160`,
+  `grep -c`, `grep "teardown counts"`,
+  `grep -E "client disconnected|idle timeout"`.
+- Exit status: n/a (read-only).
+- Result: **Definitive -- the tone never crosses the VAD threshold at
+  all.** Peak probability across the entire speech phase (343 total
+  lines) was 0.3493, at the very first window, decaying from there down
+  to the same 0.0001 floor seen for pure digital silence and never
+  spiking again. Teardown counts: `received=562 released=550 lost=0
+  duplicates=0 stale=0`, ended with `"client disconnected"` -- transport
+  fully healthy; this is purely a waveform-design problem, not a bug.
+- Relevant output summary:
+  - Probability trend: starts at 0.2069, brief noise up to 0.3493 by
+    line 6, then a steady decline through ~line 50 to below 0.01, then
+    settles at 0.0001 for the remainder of the visible trace -- never
+    once at or above the 0.5 threshold.
+  - Teardown: `received=562 released=550 lost=0 duplicates=0 stale=0`.
+  - Disconnect: `"client disconnected"` only.
+- Redacted raw output file, if any: none.
+- Follow-up: The multi-formant/AM-modulated tone from `GATEWAY-E2E-008`
+  was a worse VAD trigger than the original plain 220Hz/0.2-amplitude
+  tone, not better -- likely because a smooth, purely periodic
+  multi-tone mixture reads as more clearly non-speech to a neural VAD
+  than a single tone's sharper onset transient. `MANUAL_ACTIONS.md`'s
+  `GATEWAY-E2E-011` reverts to the single-tone design (known to at
+  least open `SpeechStarted` in every attempt from `GATEWAY-E2E-003`
+  through `007`, evidenced indirectly by real ASR decode activity),
+  changes only amplitude (0.2 -> 0.5) as one isolated variable, keeps
+  the pacing fix, and captures the real probability trace this time --
+  no prior attempt ever directly checked this design's actual numbers
+  for the speech portion.
+
 ## Result template
 
 ```markdown
