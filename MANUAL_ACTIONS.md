@@ -12,13 +12,12 @@ root-cause writeup). The bug: `UtteranceSegmenter`'s intentional
 `UtteranceOrchestrator` never released the partial-decode scheduler
 entry for it, permanently orphaning that utterance_id for the rest of
 the session. Fixed via a new `UtteranceAbandoned` event plus cleanup
-handling; locally verified with a new regression test. A real-hardware
-re-run is still needed to confirm `utterance.final` now actually
-arrives for a real utterance (the specific synthetic sine tone used by
-every `GATEWAY-E2E-*` attempt so far was separately found to be a poor
-match for real Silero VAD's "speech" classification, independent of
-the bug above) -- the next action is staged once the user decides how
-to get that real confirmation (see the question posed in chat).
+handling; locally verified with a new regression test. The user chose
+to try a louder, more speech-like synthetic tone next (rather than
+switching to a real microphone) -- `GATEWAY-E2E-008` retries with an
+amplitude-modulated multi-formant waveform instead of a flat sine tone,
+to try to get real Silero VAD to sustain "speech" classification long
+enough for a genuine `utterance.final`.
 
 ### Action ID: GATEWAY-E2E-001
 
@@ -970,6 +969,178 @@ to get that real confirmation (see the question posed in chat).
   - The client's full printed output.
   - The full `"partial decode due"` grep output.
   - The full skip/advance/duplicate trace grep output.
+  - The ASR activity grep output.
+
+### Action ID: GATEWAY-E2E-008
+
+- Status: WAITING_FOR_USER
+- Purpose: `GATEWAY-E2E-007` found and fixed a real orphaned-state bug
+  (commit `cff90bd`), but also found that every prior attempt's
+  synthetic 220Hz/0.2-amplitude sine tone was likely never going to
+  sustain real Silero VAD's "speech" classification past
+  `vad_min_speech_ms` (250ms) -- it only ever seemed to register a
+  brief blip at onset. This retry does two things at once: confirms the
+  fix (the new `UtteranceAbandoned` DEBUG log line, if the tone is
+  *still* too short, will now show the exact `speech_ms` accumulated
+  instead of silence) and tries harder to get real audio that Silero
+  will actually sustain as speech, so `utterance.final` can finally be
+  confirmed for real. The client's tone generator is replaced with a
+  louder (0.8 amplitude, was 0.2), multi-frequency, amplitude-modulated
+  waveform (four rough vowel-formant frequencies -- 180/700/1200/2400 Hz
+  -- combined and modulated at ~4 Hz to mimic syllable-rate energy
+  variation) instead of a single flat tone, and lengthens the "speech"
+  portion from 1.5s to 3s (150 frames) to give more chances for
+  confirmed speech to accumulate even if classification is intermittent.
+  This is a best-effort synthetic improvement, not real speech -- it may
+  still not be enough for Silero; if so, the new DEBUG log line will at
+  least show real numbers (exact `speech_ms` reached) to guide the next
+  adjustment instead of guessing blind again.
+- Run on: Same host/venv as prior `GATEWAY-E2E-*` actions.
+- Prerequisites: `git pull` first -- confirm with `git log -1 --oneline`
+  showing `cff90bd` or later.
+- Safety notes: Same as prior attempts (real GPU memory, synthetic audio
+  only, no real recorded speech or personal content).
+- Commands:
+  ```bash
+  cd /workspace/meeting-translator
+  source .venv-asr/bin/activate
+  git pull
+  git log -1 --oneline   # confirm cff90bd or later
+
+  pkill -f "uvicorn server.app:app" 2>/dev/null
+  sleep 1
+  LOG_LEVEL=DEBUG nohup uvicorn server.app:app --host 127.0.0.1 --port 3000 > gateway_e2e_server.log 2>&1 &
+  disown
+  sleep 5
+  curl -s http://127.0.0.1:3000/health/live
+
+  cat > /tmp/gateway_e2e_client.py << 'EOF'
+  import asyncio
+  import json
+  import math
+  import struct
+  from datetime import UTC, datetime
+
+  import websockets
+
+  from shared.protocol.binary import AudioFlags, encode_packet
+  from shared.protocol.enums import Language, StreamSource
+  from shared.protocol.messages import SessionStart, StreamConfig
+
+  FRAME_MS = 20
+  SAMPLE_RATE = 16000
+  FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
+  SPEECH_FRAME_COUNT = 150  # 3s -- longer than before, more room to accumulate speech_ms
+  SILENCE_FRAME_COUNT = 400  # 8s -- generously past any plausible VAD settling time
+  FORMANTS_HZ = (180.0, 700.0, 1200.0, 2400.0)  # rough vowel-formant spacing
+
+  def speech_like_frame(frame_index: int, amplitude: float = 0.8) -> bytes:
+      samples = []
+      for i in range(FRAME_SAMPLES):
+          t = (frame_index * FRAME_SAMPLES + i) / SAMPLE_RATE
+          envelope = 0.5 + 0.5 * math.sin(2 * math.pi * 4.0 * t)  # ~4 Hz syllable rate
+          value = sum(math.sin(2 * math.pi * f * t) for f in FORMANTS_HZ) / len(FORMANTS_HZ)
+          value = max(-1.0, min(1.0, value * amplitude * envelope))
+          samples.append(int(value * 32767))
+      return struct.pack(f"<{FRAME_SAMPLES}h", *samples)
+
+  def silence_frame() -> bytes:
+      return b"\x00\x00" * FRAME_SAMPLES
+
+  async def main() -> None:
+      session_start = SessionStart(
+          session_id="sess-gateway-e2e-008",
+          client_id="gateway-e2e-client",
+          timestamp=datetime.now(UTC),
+          streams=[
+              StreamConfig(
+                  stream_number=1,
+                  stream_id="mic-01",
+                  source=StreamSource.MICROPHONE,
+                  source_language=Language.JAPANESE,
+                  target_language=Language.VIETNAMESE,
+              )
+          ],
+      )
+      async with websockets.connect("ws://127.0.0.1:3000/ws/stream") as ws:
+          await ws.send(session_start.model_dump_json())
+
+          seq = 0
+          for i in range(SPEECH_FRAME_COUNT):
+              packet = encode_packet(
+                  stream_number=1, sequence_number=seq, client_timestamp_ms=seq * FRAME_MS,
+                  payload=speech_like_frame(i),
+              )
+              await ws.send(packet)
+              seq += 1
+          for _ in range(SILENCE_FRAME_COUNT):
+              packet = encode_packet(
+                  stream_number=1, sequence_number=seq, client_timestamp_ms=seq * FRAME_MS,
+                  payload=silence_frame(),
+              )
+              await ws.send(packet)
+              seq += 1
+
+          final_seen = False
+          for _ in range(60):
+              try:
+                  raw = await asyncio.wait_for(ws.recv(), timeout=3)
+              except asyncio.TimeoutError:
+                  seq += 1
+                  await ws.send(
+                      encode_packet(
+                          stream_number=1, sequence_number=seq,
+                          client_timestamp_ms=seq * FRAME_MS, payload=b"",
+                          flags=AudioFlags.KEEPALIVE,
+                      )
+                  )
+                  continue
+              event = json.loads(raw)
+              if event["type"] in ("transcription.partial", "utterance.final", "error"):
+                  print(f"{event['type']}: {event}")
+              if event["type"] == "utterance.final":
+                  final_seen = True
+                  break
+          if not final_seen:
+              print("TIMED OUT waiting for utterance.final")
+
+  asyncio.run(main())
+  EOF
+  PYTHONPATH=/workspace/meeting-translator python /tmp/gateway_e2e_client.py > /tmp/gateway_e2e_client.log 2>&1
+  cat /tmp/gateway_e2e_client.log
+
+  echo "=== abandonment trace (if the tone is still too short) ==="
+  grep "abandoned" gateway_e2e_server.log
+  echo "=== finalize-path trace (if it actually finalized this time) ==="
+  grep -E "finalize task|finalized reason" gateway_e2e_server.log
+  echo "=== ASR activity ==="
+  grep "faster_whisper Processing audio" gateway_e2e_server.log
+
+  pkill -f "uvicorn server.app:app"
+  ```
+- Expected success indicators: Two possible outcomes:
+  - `utterance.final` actually appears in the client output -> this is
+    the real confirmation `GATEWAY-E2E-001` has been chasing for eight
+    attempts; the finalize-path trace should show the full sequence
+    (finalized reason -> finalize task started -> calling
+    final_transcriber.finalize -> got a result), and the client should
+    print the real transcription/translation.
+  - Still no `utterance.final`, but the abandonment grep now shows a
+    line like `"utterance ... abandoned (speech_ms=N < min_speech_ms)"`
+    -> the fix is confirmed working (this is a clean, logged outcome
+    instead of a silent stall), and `N` tells us exactly how much
+    confirmed speech the new tone reached, which is real data to tune
+    the next attempt with (report the exact number).
+  Either way this is real progress -- report the actual outcome, not
+  just pass/fail.
+  Expected artifacts: `gateway_e2e_server.log`, `/tmp/gateway_e2e_client.log`.
+- Rollback or cleanup: `pkill -f "uvicorn server.app:app"` if still
+  running.
+- Return to Claude (secrets/hostnames redacted):
+  - The `git log -1 --oneline` output.
+  - The client's full printed output.
+  - The abandonment grep output (even if empty).
+  - The finalize-path trace grep output (even if empty).
   - The ASR activity grep output.
 
 ### Action ID: GATEWAY-E2E-002
