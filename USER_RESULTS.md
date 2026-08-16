@@ -1567,6 +1567,41 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   no prior attempt ever directly checked this design's actual numbers
   for the speech portion.
 
+### GATEWAY-E2E-011
+
+- Date: 2026-08-16
+- Environment: GPU server, `.venv-asr`, fresh server restart on
+  `127.0.0.1:3000` with `LOG_LEVEL=DEBUG`, single-tone client (220Hz,
+  amplitude 0.5, was 0.2) with real-time pacing (20ms/frame).
+- Command summary: server + client run normally, then the probability
+  trace, abandonment, finalize-path and ASR-activity greps against
+  `gateway_e2e_server.log`.
+- Exit status: no traceback. Client printed only
+  `TIMED OUT waiting for utterance.final`.
+- Result: **Amplitude alone confirmed insufficient; root mechanism
+  identified.** Peak probability 0.6714 at the very first window --
+  crossing the 0.5 threshold for the first time in any attempt -- but
+  only for 2 consecutive windows before dropping below threshold and
+  continuing to decay toward the silence floor. `SpeechStarted` needs
+  160ms (`vad_speech_start_ms`) of *unbroken* frames at/above
+  threshold; this design sustained only ~30-60ms. Zero abandonment/
+  finalize/ASR activity.
+- Relevant output summary:
+  - Probability sequence (first 5): 0.6714, 0.5188, 0.4495, 0.3485,
+    0.2323 -- crosses 0.5 for exactly 2 windows, then decays steadily.
+  - Abandonment/finalize-path/ASR-activity greps: all empty.
+- Redacted raw output file, if any: none.
+- Follow-up: Combined with `GATEWAY-E2E-003`'s and `010`'s probability
+  data, the pattern across three attempts is now reasonably clear:
+  real Silero responds strongly to a signal's *onset* from silence,
+  then the response fades quickly as the input settles into a
+  predictable, purely periodic waveform -- unlike real speech, which
+  continuously varies. Amplitude raises the initial spike's height, not
+  its duration. A frequency-sweep (chirp) tone was identified as a
+  plausible next synthetic fix but not attempted -- at the user's
+  direction, synthetic-tone tuning is paused here in favor of a
+  real-microphone test through the packaged Windows client.
+
 ## Result template
 
 ```markdown

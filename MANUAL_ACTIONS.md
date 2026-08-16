@@ -24,11 +24,17 @@ time there was zero VAD activity of any kind, a regression from every
 earlier attempt with the plain sine tone. `GATEWAY-E2E-010` confirmed
 why: the multi-formant/AM-modulated tone's probability never crossed
 the 0.5 threshold at all (peak 0.3493) -- it was a worse VAD trigger
-than the original plain tone, not better. `GATEWAY-E2E-011` reverts to
-the single-tone design (known to at least open `SpeechStarted`),
-changes only amplitude (0.2 -> 0.5) as one isolated adjustment, keeps
-the pacing fix, and captures the real probability trace this time
-(never directly checked for the speech portion in any prior attempt).
+than the original plain tone, not better. `GATEWAY-E2E-011` reverted to
+the single-tone design and bumped amplitude (0.2 -> 0.5): probability
+now crossed threshold (peak 0.6714) but only for ~30-60ms, well short
+of the 160ms of unbroken speech `SpeechStarted` requires -- confirming
+amplitude raises the onset spike's height, not its duration, since real
+Silero's response fades once a tone settles into a predictable,
+periodic shape. At the user's direction, synthetic-tone tuning is
+paused here in favor of testing with a real microphone through the
+packaged Windows client -- see the new action below, which is pending
+clarification on how the Windows machine can reach the GPU server
+(every server instance so far has only been bound to `127.0.0.1`).
 
 ### Action ID: GATEWAY-E2E-001
 
@@ -1468,8 +1474,37 @@ the pacing fix, and captures the real probability trace this time
 
 ### Action ID: GATEWAY-E2E-011
 
-- Status: WAITING_FOR_USER
-- Purpose: `GATEWAY-E2E-010` proved the multi-formant/AM-modulated tone
+- Status: WAITING_FOR_USER (**result in -- amplitude alone confirmed
+  insufficient; root mechanism identified.** At the user's direction,
+  synthetic-tone tuning is paused here in favor of a real-microphone
+  test via the packaged Windows client -- see the new action staged
+  below this entry.)
+- Result (2026-08-16): Peak probability reached **0.6714** at the very
+  first window -- crossing the 0.5 threshold for the first time in any
+  attempt -- but only for 2 consecutive windows (0.6714, 0.5188) before
+  dropping to 0.4495 and continuing to decay (down to ~0.04 by window
+  ~13, then under 0.01 by window ~30, settling near the silence floor
+  by window ~100). `SpeechStarted` requires `vad_speech_start_ms=160`
+  ms of *unbroken* consecutive frames at/above threshold (any frame
+  below threshold resets the provisional run to zero in
+  `UtteranceSegmenter._on_starting`) -- this design only sustained
+  roughly 30-60ms, well short of the needed 160ms. Zero abandonment/
+  finalize/ASR activity, matching a clean `TIMED OUT`.
+  - **Root mechanism** (now reasonably well understood from three data
+    points across `GATEWAY-E2E-003`/`010`/`011`): real Silero responds
+    strongly to the *onset* of a signal appearing from silence, then
+    the response fades quickly once the input settles into a
+    predictable, purely periodic waveform -- a constant-frequency tone,
+    however loud, looks progressively less speech-like the longer it
+    stays acoustically static, unlike real speech which continuously
+    varies in pitch/spectral content. Amplitude increases the initial
+    spike's height but not its duration.
+  - A frequency-sweep (chirp) tone was identified as a plausible next
+    synthetic fix (continuously changing content, never settling into
+    a predictable shape) but was not attempted -- the user chose to
+    switch to real-microphone testing via the packaged Windows client
+    instead of a fifth synthetic-tone round.
+- Original purpose (for history): `GATEWAY-E2E-010` proved the multi-formant/AM-modulated tone
   never crosses the 0.5 VAD threshold at all (peak 0.3493). Reverts to
   the single-tone design used successfully in `GATEWAY-E2E-003` through
   `007` (the design we know at least opens `SpeechStarted`, evidenced
