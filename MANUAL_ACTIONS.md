@@ -1670,7 +1670,13 @@ of controlling the GPU server).
 
 ### Action ID: GATEWAY-E2E-012
 
-- Status: WAITING_FOR_USER
+- Status: WAITING_FOR_USER (**Part A done, port-forward confirmed
+  working -- Part B blocked on a missing build.** `dist/` does not
+  exist on this machine at all -- the `WINDOWS-PACKAGE-001` build from
+  2026-08-14 was either done elsewhere or has since been cleaned up.
+  Confirmed locally with `ls dist/` -- read-only filesystem check, not
+  a GPU-server operation, so done directly rather than as a separate
+  round-trip. Updated Part B below with the rebuild step.)
 - Purpose: Four rounds of synthetic-tone engineering (`GATEWAY-E2E-008`
   through `011`) established that real Silero VAD responds to a
   signal's *onset*, not its sustained shape -- no synthetic tone tried
@@ -1726,19 +1732,16 @@ of controlling the GPU server).
   or `kubectl get pods` from wherever you normally run it) for Part B.
 - Commands -- **Part B (on your Windows machine)**:
   ```powershell
-  # 1. Forward the pod's port 3000 to your Windows machine's localhost:3000.
-  #    Replace <pod-name> and <namespace> with your actual values (use
-  #    VS Code's Kubernetes extension's "Port Forward" action on the pod
-  #    if that's easier than the CLI).
-  kubectl port-forward pod/<pod-name> 3000:3000 -n <namespace>
-  # Leave this running in its own terminal for the whole test.
+  # 1. Port-forward already confirmed working in the first attempt --
+  #    keep that terminal running (`kubectl port-forward pod/<pod-name>
+  #    3000:3000 -n <namespace>`). If it was closed, restart it first.
 
-  # 2. In a second terminal, locate (or rebuild) the packaged client.
+  # 2. In a second terminal, build the packaged client (confirmed
+  #    missing locally -- dist/ does not exist on this machine).
   cd "F:\workspaces\fpt\projects\whalelm\Realtime-meeting-translator-v2\meeting-translator"
-  Get-ChildItem dist\MeetingTranslator-0.1.0 -ErrorAction SilentlyContinue
-  # If that folder does not exist, rebuild it first:
-  #   pip install -e ".[client,windows-audio,packaging]"
-  #   python scripts/build_windows_client.py --clean
+  .venv\Scripts\pip.exe install -e ".[client,windows-audio,packaging]"
+  .venv\Scripts\python.exe scripts\build_windows_client.py --clean
+  Get-ChildItem dist\MeetingTranslator-0.1.0
 
   # 3. Point the client at the port-forwarded server.
   "CLIENT_SERVER_URL=ws://localhost:3000/ws/stream" | Out-File -Encoding utf8 dist\MeetingTranslator-0.1.0\.env
