@@ -2047,17 +2047,26 @@ from audio-in to caption-out over the real live websocket -- is now real
 and proven, with scripted ASR/translation/VAD doubles on CPU
 (`tests/test_transport_gateway_orchestration.py`). Real-hardware
 verification (`GATEWAY-E2E-001`) is **in progress with a genuine,
-unresolved finding**: two attempts both got real `transcription.partial`
-events (real Silero VAD, real faster-whisper, correct stable-prefix
-promotion) over the real live gateway -- proving the partial-decode path
-works end to end on real hardware -- but `utterance.final` never arrived
-either time. Attempt 1's cause was a test-script gap (fixed). Attempt 2,
-with that fixed, still timed out: the server log shows no further
-activity of any kind (no error, no traceback) after the last partial for
-over two minutes, consistent with the background finalize task (a real
-full-utterance decode competing for GPU with vLLM's ~76 of 81.5 GiB used)
-stalling rather than crashing -- not yet root-caused. `GATEWAY-E2E-002`
-(a live `py-spy dump` of the server process while stalled) is staged and
+unresolved finding**: four attempts have all gotten real
+`transcription.partial` events (real Silero VAD, real faster-whisper,
+correct stable-prefix promotion) over the real live gateway -- proving
+the partial-decode path works end to end on real hardware -- but
+`utterance.final` has never arrived. `py-spy` (`GATEWAY-E2E-002`) turned
+out to be unusable on this host (`ptrace` blocked even for root, no
+`sudo`). A VAD-timing hypothesis (`GATEWAY-E2E-003`) was disproved with
+real probability data (clean 0.0001 throughout the silence run). New
+DEBUG tracing through the finalize code path (`GATEWAY-E2E-004`) then
+ruled out the finalize path itself entirely: `UtteranceFinalized` never
+fires, and the partial's `end_ms` plateauing at 900ms across two
+revisions shows audio ingestion into the orchestrator stalls around
+frame ~45 -- not a finalize-path bug, not VAD-timing, and (per code
+analysis) not the rate limiter or jitter buffer either, both of which
+are ruled out structurally. The leading hypothesis is now a genuine hang
+inside `_handle_packet`'s per-frame loop in
+`server/transport/gateway.py` (the VAD executor call or
+`orchestrator.ingest_frame`). Since `py-spy` doesn't work here, Python's
+built-in `faulthandler` was added instead (needs no ptrace) to dump
+every thread's live stack on `SIGUSR1`. `GATEWAY-E2E-005` is staged and
 `WAITING_FOR_USER` in `MANUAL_ACTIONS.md`; `GATEWAY-E2E-001` is on hold
 pending that diagnosis. Per `CLAUDE.md`'s "never claim hardware
 verification from mocks," do not treat this project as ready for a real

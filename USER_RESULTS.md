@@ -1244,6 +1244,56 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   exception type, and retries. This should pinpoint exactly where
   execution stops, rather than continuing to guess.
 
+### GATEWAY-E2E-004
+
+- Date: 2026-08-16
+- Environment: GPU server, `.venv-asr`, fresh server restart on
+  `127.0.0.1:3000` with `LOG_LEVEL=DEBUG`, same client as
+  `GATEWAY-E2E-003` (400 silence frames).
+- Command summary: same pattern as `GATEWAY-E2E-003`, plus
+  `grep -E "finalize task|UtteranceFinalized|finalized reason"`,
+  `grep -B2 -A20 "Traceback"`, and
+  `grep "faster_whisper Processing audio"` against `gateway_e2e_server.log`.
+- Exit status: no traceback. Client again printed exactly 3 partials
+  then `TIMED OUT waiting for utterance.final`.
+- Result: **Finalize code path ruled out.** All three finalize-path
+  DEBUG lines (`UtteranceFinalized`/`finalized reason`/`finalize task`)
+  were completely absent -- the `UtteranceFinalized` VAD event itself
+  never fired, so `UtteranceOrchestrator`'s finalize task was never even
+  spawned. The ASR activity grep showed the same 3 `Processing audio`
+  lines as every prior attempt, clustered within under half a second,
+  and nothing after.
+- Relevant output summary:
+  - `=== finalize-path trace ===`: empty.
+  - `=== any traceback ===`: empty.
+  - `=== ASR activity ===`: 3 lines (`00:00.520`, `00:00.900`,
+    `00:00.900`), same as `GATEWAY-E2E-003`.
+- Redacted raw output file, if any: none.
+- Follow-up: Analyzed the code (not re-run) to narrow this further.
+  `UtteranceSegmenter`'s hard-silence check is pure synchronous,
+  wall-clock-independent CPU logic, so it should have fired given the
+  real 0.0001 probability data already confirmed in `GATEWAY-E2E-003` --
+  unless frames simply stopped arriving. The partial's `end_ms` staying
+  fixed at 900ms across revisions 2 and 3 confirms exactly that: audio
+  ingestion into the orchestrator (`ingest_frame`/`append_audio`)
+  stalled around frame ~45, not just ASR decoding. Two other
+  explanations were checked against the code and ruled out: the
+  WebSocket rate limiter's token bucket starts full at `burst=400`, so
+  the first 400 of the client's 475 packets always pass regardless of
+  timing (can't explain a stall at frame ~45); the jitter buffer
+  releases every in-order packet immediately with no timing dependency.
+  This leaves a genuine **hang** inside `_handle_packet`'s per-frame
+  loop in `server/transport/gateway.py` (most likely the
+  `run_in_executor` VAD probability call or `orchestrator.ingest_frame`
+  itself) as the leading explanation -- it would account for every
+  observation: no exception, no further ASR activity, the connection
+  staying open, and the ingest loop never getting back to receiving the
+  rest of the already-sent packets. Since `py-spy` is unusable on this
+  host (`GATEWAY-E2E-002`), added Python's built-in `faulthandler`
+  instead (needs no ptrace) to catch the hang in the act via a
+  `SIGUSR1`-triggered all-threads stack dump -- staged as
+  `GATEWAY-E2E-005`.
+
 ## Result template
 
 ```markdown

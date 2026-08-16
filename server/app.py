@@ -10,7 +10,9 @@ reachability probe, without ever dumping raw error/exception details.
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import logging
+import signal
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -125,6 +127,16 @@ def create_app(
     root_logger = logging.getLogger()
     if not any(isinstance(f, CorrelationFilter) for f in root_logger.filters):
         root_logger.addFilter(CorrelationFilter())
+
+    # Diagnostic aid: SIGUSR1 dumps every thread's live Python stack to
+    # stderr. Unlike py-spy, this needs no ptrace, so it still works in
+    # containers that block ptrace even for root. No-op on platforms
+    # without SIGUSR1 (e.g. Windows, where the local CPU test suite
+    # imports this module).
+    if hasattr(signal, "SIGUSR1"):
+        # faulthandler.register is POSIX-only in typeshed, so mypy can't see
+        # it while type-checking on Windows even inside this runtime guard.
+        faulthandler.register(signal.SIGUSR1, all_threads=True)  # type: ignore[attr-defined]
 
     resolved_metrics = metrics if metrics is not None else create_metrics()
     shutdown = ShutdownCoordinator()

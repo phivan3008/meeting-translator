@@ -4,16 +4,19 @@ Claude ghi các thao tác mà người dùng cần thực hiện tại đây.
 
 ## Pending actions
 
-Four actions staged after `UtteranceOrchestrator` was wired into the
+Five actions staged after `UtteranceOrchestrator` was wired into the
 live gateway (2026-08-15, at the user's direction). None is required to
 close out that work's own local scope (it is already LOCAL_VERIFIED with
 scripted doubles) -- these are the real-hardware acceptance test for it,
 per `CLAUDE.md`'s "never claim hardware verification from mocks", and
 the diagnostic trail for a real, unresolved finding hit while running
-it. `GATEWAY-E2E-001` is on hold pending `GATEWAY-E2E-004`'s finalize
--path tracing (`GATEWAY-E2E-003`'s VAD-timing hypothesis was disproved
-with real data; `GATEWAY-E2E-002`'s own diagnostic tool,
-`py-spy`, turned out to be unusable on this host -- see its entry).
+it. `GATEWAY-E2E-001` is on hold pending `GATEWAY-E2E-005`'s
+`faulthandler` thread dump (`GATEWAY-E2E-004`'s finalize-path trace came
+back completely empty, ruling out the finalize code path and pointing at
+a genuine hang somewhere in per-frame VAD/ingestion processing;
+`GATEWAY-E2E-003`'s VAD-timing hypothesis was disproved with real data;
+`GATEWAY-E2E-002`'s own diagnostic tool, `py-spy`, turned out to be
+unusable on this host -- see each entry).
 
 ### Action ID: GATEWAY-E2E-001
 
@@ -448,8 +451,58 @@ with real data; `GATEWAY-E2E-002`'s own diagnostic tool,
 
 ### Action ID: GATEWAY-E2E-004
 
-- Status: WAITING_FOR_USER
-- Purpose: Three attempts have now shown the same pattern: 3 real
+- Status: WAITING_FOR_USER (**result in** -- the finalize-path trace was
+  completely empty; `UtteranceFinalized` itself never fired. Superseded
+  by `GATEWAY-E2E-005`, not retried.)
+- Result (2026-08-16): All three grep outputs came back empty except the
+  ASR activity one, which showed the same 3 "Processing audio" lines as
+  `GATEWAY-E2E-003` (clustered within ~400ms) and nothing after. No
+  `finalize task`/`UtteranceFinalized`/`finalized reason` line ever
+  appeared, and no traceback. This rules out the finalize code path
+  entirely -- `UtteranceOrchestrator._on_vad_event`'s `UtteranceFinalized`
+  branch was never reached, meaning `UtteranceSegmenter.process_frame`
+  itself never produced that event.
+  - `UtteranceSegmenter`'s hard-silence check (`_check_silence` in
+    `server/vad/state_machine.py`) is pure synchronous CPU logic with no
+    wall-clock dependency -- it fires once `silence_run_ms` accumulated
+    across `process_frame()` calls crosses `hard_silence_ms`, regardless
+    of real time elapsed. Given probability sat at 0.0001 for the whole
+    silence run (`GATEWAY-E2E-003`), this *should* have fired well within
+    the 400 silence frames sent, unless frames simply stopped being fed
+    to it.
+  - The partial's `end_ms` staying at exactly 900ms across both revision
+    2 and 3 confirms this: `end_ms = start_ms + total_ms` in
+    `PartialTranscriber`, and `total_ms` only grows via `append_audio`,
+    called once per frame from `UtteranceOrchestrator.ingest_frame`. If
+    frames kept arriving, `end_ms` would keep climbing across revisions;
+    it didn't, so ingestion itself stalled around frame ~45 (900ms /
+    20ms), not just decoding.
+  - Two prior candidate explanations were checked and ruled out
+    analytically (not by re-running hardware, since the code proves it):
+    the WebSocket rate limiter (`TokenBucket`, `ws_rate_limit_burst=400`
+    by default) starts **full** at 400 tokens, so the first 400 of the
+    client's 475 total packets always pass regardless of send timing --
+    it cannot explain a stall at frame ~45. The jitter buffer
+    (`server/transport/jitter_buffer.py`) releases every packet
+    immediately once it arrives in order, with no timing dependency
+    either, and the client sends strictly sequential sequence numbers.
+  - Conclusion: this is very likely a genuine **hang**, not a silent
+    drop or a logic bug -- something inside `_handle_packet`'s
+    per-released-frame loop in `server/transport/gateway.py` (the
+    `await loop.run_in_executor(vad_executor, vad_model.probability,
+    frame_pcm)` call, or `await orchestrator.ingest_frame(...)` itself)
+    never returns for one particular frame, which would explain
+    everything observed: no exception (nothing raised), no further ASR
+    activity (frames never reach it), connection staying open (nothing
+    closes it), and the `_ingest_loop`'s `while True` never looping again
+    to receive more of the already-sent packets.
+  - Since `py-spy` is unusable on this host (`GATEWAY-E2E-002`,
+    `ptrace` blocked even for root), added Python's built-in
+    `faulthandler` instead (commit pending push) -- it needs no ptrace at
+    all since it dumps every thread's live stack from inside the process
+    itself, triggered by `SIGUSR1`. `GATEWAY-E2E-005` below uses it to
+    catch the hang in the act.
+- Original purpose (for history): Three attempts had shown the same
   partials, then nothing -- no 4th ASR log line, no error event, no
   traceback -- with `py-spy` unusable and the VAD-timing hypothesis
   disproved by real probability data (`GATEWAY-E2E-003`). The finalize
@@ -526,6 +579,99 @@ with real data; `GATEWAY-E2E-002`'s own diagnostic tool,
   - The full finalize-path trace grep output (even if empty -- that's
     informative too).
   - The traceback grep output, if any.
+  - The ASR activity grep output.
+
+### Action ID: GATEWAY-E2E-005
+
+- Status: WAITING_FOR_USER
+- Purpose: Catch the suspected hang in the act using Python's built-in
+  `faulthandler` (commit pushed alongside this entry), since `py-spy` is
+  unusable on this host (`GATEWAY-E2E-002`). `faulthandler.register` is
+  now called at server startup, listening for `SIGUSR1`; sending that
+  signal to the server process dumps every thread's current Python stack
+  straight to its stderr (which lands in `gateway_e2e_server.log`, same
+  redirect as always) -- no ptrace, no root, no extra tooling. The
+  client script sends all 475 packets essentially at once, so the hang
+  (if `GATEWAY-E2E-004`'s analysis is right) should already have
+  happened within the first second or two; the plan is to let it settle
+  for ~10s, then signal the server while the client is still waiting.
+- Run on: Same host/venv as prior `GATEWAY-E2E-*` actions.
+- Prerequisites: `git pull` first -- confirm with `git log -1 --oneline`
+  showing the `faulthandler` commit.
+- Safety notes: `SIGUSR1` only dumps stack traces; it does not stop or
+  restart the process, so the run can continue normally afterward.
+  `LOG_LEVEL=DEBUG` again for continuity with prior attempts, though the
+  faulthandler dump does not depend on the log level.
+- Commands:
+  ```bash
+  cd /workspace/meeting-translator
+  source .venv-asr/bin/activate
+  git pull
+  git log -1 --oneline   # confirm the faulthandler commit is present
+
+  pkill -f "uvicorn server.app:app" 2>/dev/null
+  sleep 1
+  LOG_LEVEL=DEBUG nohup uvicorn server.app:app --host 127.0.0.1 --port 3000 > gateway_e2e_server.log 2>&1 &
+  disown
+  UVICORN_PID=$!
+  sleep 5
+  curl -s http://127.0.0.1:3000/health/live
+
+  # Same client as GATEWAY-E2E-003/004 (400 silence frames) -- recreate
+  # /tmp/gateway_e2e_client.py if it's gone, unchanged from GATEWAY-E2E-003.
+  PYTHONPATH=/workspace/meeting-translator python /tmp/gateway_e2e_client.py > /tmp/gateway_e2e_client.log 2>&1 &
+  CLIENT_PID=$!
+
+  # Give the client time to blast all its packets and for the (suspected)
+  # hang to actually happen -- the 3 partials typically appear within
+  # the first second.
+  sleep 10
+
+  echo "=== sending SIGUSR1 to dump all thread stacks ==="
+  kill -USR1 $UVICORN_PID
+  sleep 2
+
+  # Let the client finish out its own timeout (up to ~180s) or just wait
+  # for it directly.
+  wait $CLIENT_PID
+  cat /tmp/gateway_e2e_client.log
+
+  echo "=== faulthandler thread dump ==="
+  grep -A 200 "Thread 0x" gateway_e2e_server.log
+  echo "=== ASR activity ==="
+  grep "faster_whisper Processing audio" gateway_e2e_server.log
+
+  pkill -f "uvicorn server.app:app"
+  ```
+- Expected success indicators: The thread dump shows one thread (either
+  the main event-loop thread or one of the `vad` `ThreadPoolExecutor`
+  workers) sitting inside a specific line of code -- that line is the
+  answer. In particular:
+  - A `vad` worker thread stuck inside `SileroVadModel.probability`/
+    `_score_window`, or inside a torch/silero_vad internal call ->
+    points at the real Silero model itself hanging or deadlocking under
+    real inference load.
+  - The main thread (or the event loop's thread) stuck at the
+    `await loop.run_in_executor(...)` line in
+    `server/transport/gateway.py`'s `_handle_packet` -> confirms it's
+    waiting on that executor call specifically (consistent with a stuck
+    `vad` worker above).
+  - The main thread stuck inside `UtteranceOrchestrator.ingest_frame` or
+    deeper (`state.segmenter.process_frame`, `self._partial.append_audio`)
+    -> points away from VAD and at the orchestrator/segmenter/partial
+    transcriber path instead.
+  - No threads shown, or the dump is empty/missing -> the signal never
+    reached the process, or the hang theory itself is wrong and something
+    else is going on (report exactly what came back either way).
+  Expected artifacts: `gateway_e2e_server.log` (contains the thread
+  dump inline), `/tmp/gateway_e2e_client.log`.
+- Rollback or cleanup: `pkill -f "uvicorn server.app:app"` if still
+  running.
+- Return to Claude (secrets/hostnames redacted):
+  - The `git log -1 --oneline` output.
+  - The full faulthandler thread-dump grep output -- this is the whole
+    point of the action, paste it in full even if long.
+  - The client's full printed output.
   - The ASR activity grep output.
 
 ### Action ID: GATEWAY-E2E-002
