@@ -1294,6 +1294,45 @@ File này lưu tóm tắt kết quả kiểm thử thủ công do người dùng
   `SIGUSR1`-triggered all-threads stack dump -- staged as
   `GATEWAY-E2E-005`.
 
+### GATEWAY-E2E-005
+
+- Date: 2026-08-16
+- Environment: GPU server, `.venv-asr`, fresh server restart on
+  `127.0.0.1:3000` with `LOG_LEVEL=DEBUG`, same client as
+  `GATEWAY-E2E-003`/`004` (400 silence frames), signaled with
+  `kill -USR1` roughly 10s after the client started.
+- Command summary: server + client launched in background, `sleep 10`,
+  `kill -USR1 $UVICORN_PID`, `wait $CLIENT_PID`, then
+  `grep -A 200 "Thread 0x" gateway_e2e_server.log` and the usual ASR
+  activity grep.
+- Exit status: no traceback. Client again printed exactly 3 partials
+  then `TIMED OUT waiting for utterance.final`.
+- Result: **Hung-executor hypothesis disproved.** The `faulthandler`
+  dump captured 5 threads, all idle: two `tqdm` monitor threads in
+  `Event.wait()` (unrelated, always-present background threads), one
+  `concurrent.futures.thread._worker` blocked in its own work-queue
+  `get()` (i.e. not executing anything), one `anyio` backend thread
+  blocked in `queue.get()`, and the current/main thread sitting at the
+  generic top-level `asyncio.run`/uvicorn entry frames with no deeper
+  application frames visible -- the signature of a genuinely idle event
+  loop, not one suspended mid-`await` on a pending future. ASR activity
+  grep: same 3 lines as every prior attempt, nothing further.
+- Relevant output summary:
+  - Full thread dump (5 threads, all idle) pasted by the user; no thread
+    was executing `SileroVadModel.probability`, `ingest_frame`, or any
+    other application code at the moment of the signal.
+  - ASR activity: 3 lines (`00:00.520`, `00:00.900`, `00:00.900`).
+- Redacted raw output file, if any: none.
+- Follow-up: Since nothing is stuck inside a call, the question shifts
+  from "what's hanging?" to "did the remaining ~430 of the client's 475
+  packets ever reach the server's application layer at all?" --
+  `MANUAL_ACTIONS.md`'s `GATEWAY-E2E-006` adds direct per-packet
+  sequence-number logging (DEBUG) plus a per-stream teardown summary of
+  total received/released/lost/duplicate/stale counts (INFO), and greps
+  for two already-existing but never-yet-checked log lines
+  (`"client disconnected"` / `"... idle timeout"`) to see which side
+  actually ended the session.
+
 ## Result template
 
 ```markdown

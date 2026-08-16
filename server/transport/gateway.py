@@ -189,6 +189,17 @@ async def _flush_all_streams(orchestrator: UtteranceOrchestrator, session: Sessi
     ``server/app.py``'s ``_check_translation_backend``.
     """
     for context in session.streams:
+        _LOG.info(
+            "session %s stream %s teardown counts: received=%d released=%d "
+            "lost=%d duplicates=%d stale=%d",
+            session.session_id,
+            context.stream_id,
+            context.packets_received,
+            context.frames_released,
+            context.lost,
+            context.duplicates,
+            context.stale,
+        )
         try:
             await orchestrator.flush_stream(context.stream_id, FinalReason.SESSION_END)
         except Exception:  # noqa: BLE001 - cleanup must not block on a single stream's failure
@@ -443,6 +454,16 @@ async def _handle_packet(
         source = context.config.source.value
         context.packets_received += 1
         metrics.packets_received_total.labels(source=source).inc()
+        # DEBUG-only: sequence number/flags/size, never audio content --
+        # lets a diagnostic session confirm exactly how many packets the
+        # app layer actually saw and where delivery stops, if ever.
+        _LOG.debug(
+            "packet decoded seq=%d flags=%d bytes=%d received_total=%d",
+            header.sequence_number,
+            header.flags,
+            len(payload),
+            context.packets_received,
+        )
 
         # Keepalive frames are heartbeats: they carry no audio to order or
         # release.

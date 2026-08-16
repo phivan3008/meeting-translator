@@ -4,19 +4,20 @@ Claude ghi các thao tác mà người dùng cần thực hiện tại đây.
 
 ## Pending actions
 
-Five actions staged after `UtteranceOrchestrator` was wired into the
+Six actions staged after `UtteranceOrchestrator` was wired into the
 live gateway (2026-08-15, at the user's direction). None is required to
 close out that work's own local scope (it is already LOCAL_VERIFIED with
 scripted doubles) -- these are the real-hardware acceptance test for it,
 per `CLAUDE.md`'s "never claim hardware verification from mocks", and
 the diagnostic trail for a real, unresolved finding hit while running
-it. `GATEWAY-E2E-001` is on hold pending `GATEWAY-E2E-005`'s
-`faulthandler` thread dump (`GATEWAY-E2E-004`'s finalize-path trace came
-back completely empty, ruling out the finalize code path and pointing at
-a genuine hang somewhere in per-frame VAD/ingestion processing;
-`GATEWAY-E2E-003`'s VAD-timing hypothesis was disproved with real data;
-`GATEWAY-E2E-002`'s own diagnostic tool, `py-spy`, turned out to be
-unusable on this host -- see each entry).
+it. `GATEWAY-E2E-001` is on hold pending `GATEWAY-E2E-006`'s direct
+per-packet count (`GATEWAY-E2E-005`'s `faulthandler` thread dump showed
+the server genuinely idle, ruling out a hung executor call;
+`GATEWAY-E2E-004`'s finalize-path trace came back completely empty,
+ruling out the finalize code path; `GATEWAY-E2E-003`'s VAD-timing
+hypothesis was disproved with real data; `GATEWAY-E2E-002`'s own
+diagnostic tool, `py-spy`, turned out to be unusable on this host -- see
+each entry).
 
 ### Action ID: GATEWAY-E2E-001
 
@@ -583,8 +584,29 @@ unusable on this host -- see each entry).
 
 ### Action ID: GATEWAY-E2E-005
 
-- Status: WAITING_FOR_USER
-- Purpose: Catch the suspected hang in the act using Python's built-in
+- Status: WAITING_FOR_USER (**result in** -- the thread dump showed
+  everything idle, contradicting the "hung in `run_in_executor`"
+  hypothesis. Superseded by `GATEWAY-E2E-006`, not retried.)
+- Result (2026-08-16): `kill -USR1` successfully dumped every thread's
+  stack. All of them were idle: both `tqdm` monitor threads blocked in
+  `Event.wait()` (unrelated background threads, always present), the one
+  spawned `ThreadPoolExecutor` worker blocked in its own work-queue
+  `get()` (i.e. **not** executing a VAD call), the `anyio` backend thread
+  blocked in `queue.get()`, and the main/event-loop thread sitting at the
+  generic top-level `asyncio.run` entry frame with no task actively
+  executing -- the signature of a genuinely idle event loop (blocked in
+  epoll/select), not one stuck mid-await on a pending future. Same 3 ASR
+  `Processing audio` lines as every prior attempt, nothing further.
+  - This rules out `GATEWAY-E2E-004`'s leading hypothesis: nothing is
+    hung *inside* a call. The server side is simply not receiving any
+    more packets at the application layer after the first ~45 frames'
+    worth. The open question shifted from "what's blocking?" to "did the
+    remaining ~430 packets ever reach `_handle_packet` at all, and if
+    not, why not?" -- `GATEWAY-E2E-006` adds direct per-packet sequence
+    logging plus a teardown summary of total counts to answer that with
+    real data instead of more inference from indirect signals.
+- Original purpose (for history): Catch the suspected hang in the act
+  using Python's built-in
   `faulthandler` (commit pushed alongside this entry), since `py-spy` is
   unusable on this host (`GATEWAY-E2E-002`). `faulthandler.register` is
   now called at server startup, listening for `SIGUSR1`; sending that
@@ -672,6 +694,93 @@ unusable on this host -- see each entry).
   - The full faulthandler thread-dump grep output -- this is the whole
     point of the action, paste it in full even if long.
   - The client's full printed output.
+  - The ASR activity grep output.
+
+### Action ID: GATEWAY-E2E-006
+
+- Status: WAITING_FOR_USER
+- Purpose: `GATEWAY-E2E-005`'s thread dump showed the server genuinely
+  idle, not stuck inside a call -- ruling out the "hung executor"
+  hypothesis. The open question is now: how many of the client's 475
+  packets did the server's application layer (`_handle_packet`) actually
+  see before things went quiet? New DEBUG logging (commit pending push)
+  logs every decoded packet's sequence number/flags/size (never audio
+  content) as it's processed, plus an INFO-level per-stream summary of
+  total received/released/lost/duplicate/stale counts, logged on session
+  teardown (`_flush_all_streams`). This also captures whichever of the
+  two already-existing (but never explicitly checked) log lines fires on
+  teardown: `"client disconnected"` (client-initiated close) or
+  `"session ... idle timeout"` (server-initiated close after
+  `ws_idle_timeout_ms`, default 15s, of silence) -- worth grepping for
+  both this time, since neither was specifically checked in any prior
+  attempt.
+- Run on: Same host/venv as prior `GATEWAY-E2E-*` actions.
+- Prerequisites: `git pull` first -- confirm with `git log -1 --oneline`
+  showing the new per-packet tracing commit.
+- Safety notes: Same as prior attempts (real GPU memory, synthetic sine
+  tone only). `LOG_LEVEL=DEBUG` again, needed for the per-packet lines
+  (the teardown summary is INFO and will show regardless).
+- Commands:
+  ```bash
+  cd /workspace/meeting-translator
+  source .venv-asr/bin/activate
+  git pull
+  git log -1 --oneline   # confirm the per-packet tracing commit is present
+
+  pkill -f "uvicorn server.app:app" 2>/dev/null
+  sleep 1
+  LOG_LEVEL=DEBUG nohup uvicorn server.app:app --host 127.0.0.1 --port 3000 > gateway_e2e_server.log 2>&1 &
+  disown
+  sleep 5
+  curl -s http://127.0.0.1:3000/health/live
+
+  # Same client as GATEWAY-E2E-003/004/005 (400 silence frames) --
+  # recreate /tmp/gateway_e2e_client.py if it's gone, unchanged from
+  # GATEWAY-E2E-003. Run it to completion this time (no backgrounding
+  # needed -- just let it finish or time out on its own).
+  PYTHONPATH=/workspace/meeting-translator python /tmp/gateway_e2e_client.py > /tmp/gateway_e2e_client.log 2>&1
+  cat /tmp/gateway_e2e_client.log
+
+  echo "=== last 20 packet-decoded lines ==="
+  grep "packet decoded" gateway_e2e_server.log | tail -20
+  echo "=== total packet-decoded line count ==="
+  grep -c "packet decoded" gateway_e2e_server.log
+  echo "=== teardown counts ==="
+  grep "teardown counts" gateway_e2e_server.log
+  echo "=== disconnect / idle-timeout lines ==="
+  grep -E "client disconnected|idle timeout" gateway_e2e_server.log
+  echo "=== ASR activity ==="
+  grep "faster_whisper Processing audio" gateway_e2e_server.log
+
+  pkill -f "uvicorn server.app:app"
+  ```
+- Expected success indicators: This should give a direct count instead
+  of inference:
+  - If the total `packet decoded` count is far below 475 (e.g. ~45-50)
+    -> confirms packets genuinely stop arriving at the server's app
+    layer partway through, meaning the problem is below `_handle_packet`
+    (transport/ASGI/network layer, or the client not actually sending
+    what it appears to send) -- worth knowing the exact last sequence
+    number logged.
+  - If the count is close to 475 -> means packets *did* all arrive, and
+    the earlier "stalled at frame ~45" conclusion (from the partial's
+    frozen `end_ms`) needs to be revisited -- something else would be
+    silently absorbing them without advancing `end_ms` (a new,
+    unexpected finding worth its own follow-up).
+  - The disconnect/idle-timeout grep tells us how the session eventually
+    ended: server-initiated idle timeout vs. client-initiated close vs.
+    neither logged (session possibly still technically open when
+    `pkill` ended it).
+  Report the actual numbers either way, not just pass/fail.
+  Expected artifacts: `gateway_e2e_server.log`, `/tmp/gateway_e2e_client.log`.
+- Rollback or cleanup: `pkill -f "uvicorn server.app:app"` if still
+  running.
+- Return to Claude (secrets/hostnames redacted):
+  - The `git log -1 --oneline` output.
+  - The client's full printed output.
+  - The last-20 `packet decoded` lines and the total count.
+  - The teardown-counts line(s).
+  - The disconnect/idle-timeout grep output (even if empty).
   - The ASR activity grep output.
 
 ### Action ID: GATEWAY-E2E-002
